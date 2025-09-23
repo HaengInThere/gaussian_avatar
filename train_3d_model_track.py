@@ -81,23 +81,23 @@ def training_report(cfg, tb_writer, iteration, losses, elapsed, testing_iteratio
                             image = torch.clamp(render_output['render'], 0.0, 1.0)
                             gt_image = torch.clamp(viewpoint.original_image.to(device), 0.0, 1.0)
                             
-                            # Normal
-                            if viewpoint.original_normal is not None:
+                            # # Normal
+                            # if viewpoint.original_normal is not None:
 
-                                pred_n = render_output['normal'].to(device)   
-                                gt_n01 = viewpoint.original_normal.to(device)  
-                                mask = viewpoint.original_mask.to(device)       
-                                if mask.ndim == 2:
-                                    mask = mask.unsqueeze(0)
-                                bg = background[:, None, None] 
+                            #     pred_n = render_output['normal'].to(device)   
+                            #     gt_n01 = viewpoint.original_normal.to(device)  
+                            #     mask = viewpoint.original_mask.to(device)       
+                            #     if mask.ndim == 2:
+                            #         mask = mask.unsqueeze(0)
+                            #     bg = background[:, None, None] 
 
-                                pred_vis = (pred_n.clamp(-1, 1) * 0.5 + 0.5)
-                                gt_vis   = gt_n01.clamp(0, 1)
+                            #     pred_vis = (pred_n.clamp(-1, 1) * 0.5 + 0.5)
+                            #     gt_vis   = gt_n01.clamp(0, 1)
 
-                                pred_normal = pred_vis * mask + bg * (1.0 - mask)
-                                gt_normal   = gt_vis   * mask + bg * (1.0 - mask)
-                                normal_cache.append(pred_normal)
-                                gt_normal_cache.append(gt_normal)
+                            #     pred_normal = pred_vis * mask + bg * (1.0 - mask)
+                            #     gt_normal   = gt_vis   * mask + bg * (1.0 - mask)
+                            #     normal_cache.append(pred_normal)
+                            #     gt_normal_cache.append(gt_normal)
 
                             l1_test += l1_loss(image, gt_image).mean().double()
                             psnr_test += psnr(image, gt_image).mean().double()
@@ -115,13 +115,13 @@ def training_report(cfg, tb_writer, iteration, losses, elapsed, testing_iteratio
                     n_vis = min(num_vis_img, len(image_cache))
                     pred_batch = torch.stack(image_cache[:n_vis], dim=0)  # (N, C, H, W)
                     gt_batch   = torch.stack(gt_image_cache[:n_vis], dim=0)
-                    pred_normal = torch.stack(normal_cache[:n_vis], dim=0)  # (N, C, H, W)
-                    gt_normal   = torch.stack(gt_normal_cache[:n_vis], dim=0)
+                    # pred_normal = torch.stack(normal_cache[:n_vis], dim=0)  # (N, C, H, W)
+                    # gt_normal   = torch.stack(gt_normal_cache[:n_vis], dim=0)
                     tb_writer.add_images(f"{config['name']}/render", pred_batch, global_step=iteration)
                     tb_writer.add_images(f"{config['name']}/ground_truth", gt_batch, global_step=iteration)
                     tb_writer.add_images(f"{config['name']}/error", (pred_batch - gt_batch).abs(), global_step=iteration)
-                    tb_writer.add_images(f"{config['name']}/normal", pred_normal, global_step=iteration)
-                    tb_writer.add_images(f"{config['name']}/normal_gt",   gt_normal,   global_step=iteration)
+                    # tb_writer.add_images(f"{config['name']}/normal", pred_normal, global_step=iteration)
+                    # tb_writer.add_images(f"{config['name']}/normal_gt",   gt_normal,   global_step=iteration)
                 print("[ITER {}] Evaluating {}: L1 {:.4f} PSNR {:.4f} SSIM {:.4f} LPIPS {:.4f}".format(iteration, config['name'], l1_test, psnr_test, ssim_test, lpips_test))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
@@ -193,10 +193,8 @@ def main(args):
         d3_output = head_model.build_gaussian(geom, uv_maps=feat_uv_dict)
         render_output = render_base(viewpoint_cam, d3_output["gaussian"], background)
 
-        if iteration < 3000:
-            loss_output = criterions(render_output, d3_output, viewpoint_cam, background, device, train_normal=False)
-        else:
-            loss_output = criterions(render_output, d3_output, viewpoint_cam, background, device, train_normal=True)
+        loss_output = criterions(render_output, d3_output, viewpoint_cam, background, device, train_normal=False)
+
         loss = loss_output['loss']
 
         viewspace_points    = render_output['viewspace_points']
@@ -207,18 +205,8 @@ def main(args):
 
         loss.backward()
 
-        if iteration==(1 or 0) or iteration % 1000 == 0:
-            if viewpoint_cam.original_normal is None:
-                continue
-            cat_pred = torch.cat(
-                [render_output['render'],
-                 render_output['normal']*0.5 + 0.5,], dim=-1
-                 )
-            cat_gt = torch.cat(
-                [viewpoint_cam.original_image, 
-                 viewpoint_cam.original_normal,], dim=-1
-                 )
-            tmp_image = torch.cat([cat_gt, cat_pred], dim=-2)
+        if iteration==1 or iteration % 1000 == 0:
+            tmp_image = torch.cat([render_output['render'], viewpoint_cam.original_image], dim=-1)
             save_image(tmp_image, f'{output_path}/img_log_{iteration:06d}.png')
             
         #------------------------ do gaussian maintain ------------------------#
@@ -291,7 +279,6 @@ def main(args):
         if iteration in args.saving_iterations:
             ckp_dir = os.path.join(output_path, "train", "checkpoint")
             os.makedirs(ckp_dir, exist_ok=True)
-            # Full checkpoint (모델/옵티마이저/스테이지/iter까지)
             save_full_checkpoint(
                 save_dir=ckp_dir,
                 iteration=iteration,
@@ -325,8 +312,8 @@ if __name__=="__main__":
     parser.add_argument("--saving_iterations", required=False, default=[1000, 5000, 10000, 20000, 30000, 40000, 50000, 100000,200000,300000,500000,1000000])
     parser.add_argument("--full_iter", default=300000)
     parser.add_argument("--white_background", required=False, default=True)
-    parser.add_argument("--base_path", default="/hdd1/DB/MDI/250814/KSM_B_TRACK")
-    # parser.add_argument("--base_path", default="/hdd1/DB/nersemble_export/nersemble_export/UNION_228") 
+    # parser.add_argument("--base_path", default="/hdd1/DB/MDI/250814/KSM_B_TRACK")
+    parser.add_argument("--base_path", default="/hdd1/DB/nersemble_export/nersemble_export/UNION_227") 
     parser.add_argument("--lgt_type", default=None) # cube or hdr
     parser.add_argument("--output_base_path", default="./output/track")
     parser.add_argument("--version", default="final_gt_normal")

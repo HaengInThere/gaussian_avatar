@@ -108,7 +108,7 @@ class MDIDataMultiview:
         else:
             self.train_cameras = self.make_cameras_list(mode="train")
             self.test_cameras = self.make_cameras_list(mode="test")
-            self.light_list = list(set(self.make_light_list(mode="train") + self.make_light_list(mode="train")))
+            # self.light_list = list(set(self.make_light_list(mode="train") + self.make_light_list(mode="train")))
     
     def get_id_params(self, mean: bool = True):
         """
