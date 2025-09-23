@@ -1,0 +1,95 @@
+mode: train
+lmk_path: "./assets/flame/landmark_embedding.npy"
+template_mesh_path: "./assets/flame/head_template_mesh_vhap.obj"  # make from flame.py
+white_background: true
+tex_size: 512
+normal_offset: 0.05 
+n_shape: 300
+n_expr: 100
+n_pose: 15
+resize_scale: true #true
+delta_vertex: false
+img_h: 1280
+img_w: 1000
+
+model:
+  use_unet: True
+  geometry_use_norm_only: True
+  act: relu
+
+  # Conditioning
+  cond_mode: film
+  flame_cond_dim: 118  # expression + pose
+
+  # FiLM MLP hidden width
+  hidden_dim: 128
+
+  # Width/depth controls
+  mid_ch_app: 32   # appearance branch base width (UNet enc1 / tower mid)
+  mid_ch_geo: 32   # geometry branch base width (UNet enc1_g / tower mid)
+  depth_app: 1     # only used for tower mode
+  depth_geo: 1     # only used for tower mode
+
+  # Range initializations
+  dpos_scale_init: 0.1
+  scale_log_range_init: 2.0
+  dnormal_scale_init: 1.0
+  dnormal_spec_scale_init: 0.5
+  
+loss:
+  rgb_type: 'l1'  # l2
+  scale_threshold: 9.0 # 9.0
+  weight:
+    rgb_loss: 1.0 
+    vgg_loss: 0.0   # 0.1
+    dssim_loss: 0.25  # 0.25
+    scale_loss: 0.1 
+    lpips_loss: 0.0
+    rot_loss: 0
+    laplacian_loss: 100000.0
+    normal_loss: 0
+    flame_loss: 0
+    lambda_depth_var: 1e-2
+    lambda_normal_smooth: 0.02
+    lambda_normal: 0.01
+
+training:
+  full_iter:          300001 # set # iterations 
+
+  position_lr_init:   0.0005
+  feature_dc_lr:      0.0025 
+  opacity_lr:         0.05
+  scaling_lr:         0.0005 
+  rotation_lr:        0.001
+  offset_lr:          0.0016 
+  delta_vertex_lr:    0.000001
+
+  percent_dense: 0.01
+  position_lr_init : 0.0005
+  position_lr_final : 0.001
+  position_lr_delay_mult : 0.01
+  position_lr_max_steps : 30_000
+
+  static_lr : 0.0001
+  lr_uv_canon: 0.000001
+  pbr_lr: 0.0001
+  pbr_tex_lr: 0.001
+  light_lr: 0.1
+
+  lr_schedule:
+    type: cosine          # 'cosine' 또는 'multistep'
+    warmup: 0          # initial warm-up iteration 
+    min_lr_mult: 0.01     # 최종 LR = initial_lr * min_lr_mult
+    total_steps: 300000   # 전체 decay 길이 (없으면 full_iter 사용)
+
+  # Gaussian maintainer
+  opacity_reset_interval: 60000
+  densify_interval:       1000 
+  prune_interval:         2000
+  min_opacity:            0.005
+  increase_num:           1000
+  max_points_num:         200000  
+
+test: 
+  test_flag : False
+  start_checkpoint : None

@@ -1,0 +1,12 @@
+*.png
+*.jpg
+*.log
+__pycache__/
+output/
+assets/
+flame/
+submodules/
+nvdiffrast/
+r3dg-rasterization/
+libs/pbr/renderutils/
+libs/renderutils/
