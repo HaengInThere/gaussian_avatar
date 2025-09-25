@@ -361,7 +361,58 @@ class UVPredictorUNet(nn.Module):
             "normal": normal,
             "geo_feat": dgeom["geo_feat"],
         }
+    
+    def forward_canon_geo(self, geom):
+        canon_xyz  = geom["canon_xyz"].unsqueeze(0).expand(1, -1, -1, -1)            # (B,3,H,W)
+        canon_slog = geom["canon_slog"].unsqueeze(0).expand(1, -1, -1, -1)          # (B,3,H,W)
+        canon_rot  = _qnormalize(geom["canon_rot"]).unsqueeze(0).expand(1, -1, -1, -1)  # (B,4,H,W)
 
+
+        # ===== build_gaussian 와 동일한 기준으로 맞추기 =====
+        # base_pos: (1,N,3) → (1,3,H,W) → (B,3,H,W)
+        uv_base_pos = geom["uv_base_pos"].expand(1, -1, -1, -1)
+        uv_base_normal = geom["uv_base_normal"].expand(1, -1, -1, -1)
+
+        # Position
+        canon_pos_rotated = rotate_canon_to_normal(uv_base_normal, canon_xyz)
+        pos  = uv_base_pos + canon_pos_rotated   # ★ 
+        # Scale (log-domain)
+        slog = canon_slog                                   # ★ 동일
+
+        # Rotation                              # ★ 동일
+        rot = _qnormalize(canon_rot)
+        # Normal: base_normal (+ dnormal)
+
+        # base normal. 배치 크기에 맞춰 확장
+        n = F.normalize(uv_base_normal, dim=1, eps=1e-6)  # [B,3,H,W]
+
+        # per-pixel TBN 구축. up과 거의 평행하면 side를 사용
+        up   = torch.tensor([0.0, 1.0, 0.0], device=n.device, dtype=n.dtype).view(1,3,1,1).expand_as(n)
+        side = torch.tensor([1.0, 0.0, 0.0], device=n.device, dtype=n.dtype).view(1,3,1,1).expand_as(n)
+        use_side = (n.mul(up).sum(1, keepdim=True).abs() > 0.99).expand_as(n)
+        a = torch.where(use_side, side, up)
+
+        t = F.normalize(torch.cross(a, n, dim=1), dim=1, eps=1e-6)  # tangent
+        b = F.normalize(torch.cross(n, t, dim=1), dim=1, eps=1e-6)  # bitangent
+
+        # canon offset을 base 기준 로컬 축으로 해석
+        # geom['canon_normal']: [B,3,H,W], 로컬 축 (t,b,n)에서의 회전 벡터(라디안 규모)라고 가정
+        omega_local = geom['canon_normal']
+
+        # 로컬->월드 변환
+        omega_world = omega_local[:, :1] * t + omega_local[:, 1:2] * b + omega_local[:, 2:3] * n
+
+        # 작은 회전 근사: n' = n + ω × n. 이후 정규화
+        delta_scale = getattr(self, "delta_normal_scale", 1.0)  # 필요 시 크기 조절
+        normal = F.normalize(n + delta_scale * torch.cross(omega_world, n, dim=1), dim=1, eps=1e-6)
+
+        return {
+            "pos": pos,
+            "slog": slog,
+            "rot":  rot,
+            "normal": normal,
+        }
+    
     def forward_gaussian_app(
         self,
         flame_cond: torch.Tensor,

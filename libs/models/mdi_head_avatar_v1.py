@@ -20,7 +20,7 @@ from libs.models.gaussian_model   import GaussianModel
 # from libs.render.mesh_renderer    import NVDiffRenderer
 from libs.nets.gaussian_uv_mapper import GaussianUVMapper
 from libs.utils.general_utils   import inverse_sigmoid, RGB2SH, get_bg_color
-from libs.utils.graphics_utils  import compute_vertex_normals, quat_rotate, update_normal_expmap, quat_from_two_vectors, rodrigues_to_quat
+from libs.utils.graphics_utils  import compute_vertex_normals, quat_rotate, rotate_canon_to_normal
 from libs.utils.camera_utils import get_camera_position
 from libs.utils.mesh_sampling     import (
     uniform_sampling_barycoords,
@@ -97,6 +97,12 @@ class MDIHeadAvatar(nn.Module):
         self.canon_normal = nn.Parameter(
             torch.zeros(3, H, W).requires_grad_(True)
         )
+        self.canon_color = nn.Parameter(
+            torch.ones(1, 3, H, W).requires_grad_(True)*0.5
+        )
+        self.canon_opacity = nn.Parameter(
+            torch.ones(1, 1, H, W).requires_grad_(True)*0.5
+        )
         with torch.no_grad():
             # identity quat (w,x,y,z) = (1,0,0,0)
             self.canon_rot[0].fill_(1.0)
@@ -105,10 +111,10 @@ class MDIHeadAvatar(nn.Module):
         _, face_scaling_canonical    = compute_face_orientation(self.canonical_verts.squeeze(0), self.faces, return_scale=True)
         self.register_buffer('face_scaling_canonical', face_scaling_canonical)
 
-        self.delta_shapedirs    = torch.zeros_like(self.flame.shapedirs)
+        # self.delta_shapedirs    = torch.zeros_like(self.flame.shapedirs)
         # self.delta_shapedirs    = nn.Parameter(self.delta_shapedirs.requires_grad_(True))
 
-        self.delta_posedirs     = torch.zeros_like(self.flame.posedirs)
+        # self.delta_posedirs     = torch.zeros_like(self.flame.posedirs)
         # self.delta_posedirs     = nn.Parameter(self.delta_posedirs.requires_grad_(True))
 
         self.delta_vertex       = torch.zeros_like(self.flame.v_template)
@@ -274,6 +280,33 @@ class MDIHeadAvatar(nn.Module):
         # if you use this as a boolean mask during training, make it bool:
         self.register_buffer('sample_flag',        torch.zeros(self.num_points, dtype=torch.bool))
 
+
+    def _sample_uv_features(self, feature):
+
+        # self.uv_albedo, self.uv_roughness, self.uv_metallic: (C,H,W)
+
+        def _precompute_xy_idx(H: int, W: int):
+            # self.uv_grid: (1,N,1,2) in [-1,1]
+            grid = self.uv_grid.view(1, -1, 2)[0]
+            gx, gy = grid[:, 0], grid[:, 1]
+            # align_corners=True → idx = round((g+1)/2 * (size-1))
+            x = torch.round((gx + 1.0) * 0.5 * (W - 1)).long().clamp_(0, W - 1)
+            y = torch.round((gy + 1.0) * 0.5 * (H - 1)).long().clamp_(0, H - 1)
+            return x, y
+
+        # albedo
+        C, H, W = feature.shape
+        x_idx, y_idx = _precompute_xy_idx(H, W)
+        feature_lin = feature[:, y_idx, x_idx].permute(1,0).contiguous()   # (N,3)
+
+
+        # self.uv_grid: (1,N,1,2) in [-1,1]
+        grid = self.uv_grid  # (1,N,1,2)
+        # bilinear sampling
+        val = F.grid_sample(feature[None], grid, mode='bilinear', padding_mode='zeros', align_corners=True)  # (1,C,N,1)
+        # reshape to (N,C)
+        return val.squeeze(0).squeeze(-1).permute(1,0).contiguous()
+    
 
     def _sample_uv_pbr_features(self):
 
@@ -487,6 +520,9 @@ class MDIHeadAvatar(nn.Module):
             'canon_xyz': self.canon_xyz,
             'canon_slog':self.canon_slog,
             'canon_rot': self.canon_rot,
+            'canon_color':self.canon_color,
+            'canon_opacity':self.canon_opacity,
+            'canon_normal': self.canon_normal,
         }
 
     def _bary_reweight_attr(self, attr_verts: torch.Tensor) -> torch.Tensor:
@@ -501,6 +537,805 @@ class MDIHeadAvatar(nn.Module):
         out    = (sel * bc).sum(dim=1)            # (N,D)
         return out
 
+    def build_canonical_gaussian(self, geom, uv_maps=None):
+
+        self._uv_valid_mask = geom.get('uv_valid_mask', None)   # ★ mask 보관
+        # Always sample PBR features at the top (only once)
+        albedo_lin, roughness_lin, metallic_lin = self._sample_uv_pbr_features()
+
+        eps_floor = 0.01
+        # ===== Appearance =====
+        color_logit = self._sample_uv_features(geom["canon_color"][0]) 
+        opacity_logit_raw = self._sample_uv_features(geom["canon_opacity"][0])
+
+        # # color logits
+        # color_logit = sampled['canon_color']
+
+        # # opacity logits
+        # opacity_logit_raw = sampled['canon_opacity']
+        prob = torch.sigmoid(opacity_logit_raw)
+
+        prob = prob * (1.0 - eps_floor) + eps_floor
+        prob = prob.clamp(eps_floor, 1 - 0.00001)
+        opacity_logit_eff = inverse_sigmoid(prob)
+        
+
+        # ===== Gaussian container =====
+        gaussian = GaussianModel(sh_degree=0)
+        gaussian._features_dc   = color_logit[:, None, :]  # (N,1,3)
+        gaussian._features_rest = torch.empty(color_logit.shape[0], 0, 3, requires_grad=False)
+        gaussian._opacity       = opacity_logit_eff
+        gaussian._albedo        = albedo_lin
+        gaussian._roughness     = roughness_lin
+        gaussian._metallic      = metallic_lin
+
+        # ===== Geometry =====
+        sampled = self._sample_uv_features_from(uv_maps, 
+                                                keys=["pos", "slog", "rot","normal"])
+        gaussian._xyz = sampled['pos']
+
+        # --- after ---
+        LOG_S_MIN, LOG_S_MAX = -8.0, -0.1  # exp() 기준 ≈ [3.4e-4, 20.1]
+        slog = sampled['slog'].clamp(LOG_S_MIN, LOG_S_MAX)
+        gaussian._scaling = slog
+        # gaussian._scaling = sampled['slog']
+
+        gaussian._rotation = sampled['rot']
+
+        gaussian._normal = sampled['normal']
+
+        # -------------------------
+        # Regularization terms
+        # -------------------------
+        # 유효 UV 마스크가 있으면 그 위에서 평균. 없으면 전 픽셀
+
+
+        mask = geom.get("uv_valid_mask", None)  # (1,1,H,W) or (B,1,H,W)
+        if mask is not None:
+            m = mask.float().clamp(min=0.0, max=1.0)
+            m = m.expand(1, 1, self.uv_resolution, self.uv_resolution)
+
+            def _smooth_loss_on_mask(x):
+                """
+                x: (B,C,H,W) uv map
+                return: smoothness loss (scalar)
+                """
+                dx = x[:, :, :, 1:] - x[:, :, :, :-1]       # horizontal gradient
+                dy = x[:, :, 1:, :] - x[:, :, :-1, :]       # vertical gradient
+
+                mx = m[:, :, :, 1:] * m[:, :, :, :-1]       # valid mask for dx
+                my = m[:, :, 1:, :] * m[:, :, :-1, :]       # valid mask for dy
+
+                loss_x = (dx.pow(2) * mx).sum() / (mx.sum() + 1e-8)
+                loss_y = (dy.pow(2) * my).sum() / (my.sum() + 1e-8)
+
+                return 0.5 * (loss_x + loss_y)
+        else:
+            def _smooth_loss_on_mask(x):
+                dx = x[:, :, :, 1:] - x[:, :, :, :-1]
+                dy = x[:, :, 1:, :] - x[:, :, :-1, :]
+                return 0.5 * (dx.pow(2).mean() + dy.pow(2).mean())
+
+        pos_smt = _smooth_loss_on_mask(uv_maps['pos'].abs()).mean(dim=0, keepdim=True)
+        slog_smt = _smooth_loss_on_mask(uv_maps['slog'].abs()).mean(dim=0, keepdim=True)
+        rot_smt = _smooth_loss_on_mask(uv_maps['rot'].abs()).mean(dim=0, keepdim=True)
+        normal_smt = _smooth_loss_on_mask(uv_maps['normal'].abs()).mean(dim=0, keepdim=True)
+
+
+        import copy
+import torch, os
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import math
+from pytorch3d.io   import load_obj
+from pytorch3d.ops  import knn_points
+from pytorch3d.transforms import (
+    quaternion_to_axis_angle,
+    matrix_to_quaternion,
+    quaternion_multiply,
+    axis_angle_to_quaternion
+)
+
+from libs.models.flame            import FlameHead
+from libs.models.gaussian_model   import GaussianModel
+# from libs.render.render_3dgs      import 
+# from libs.render.render_step1     import render
+# from libs.render.mesh_renderer    import NVDiffRenderer
+from libs.nets.gaussian_uv_mapper import GaussianUVMapper
+from libs.utils.general_utils   import inverse_sigmoid, RGB2SH, get_bg_color
+from libs.utils.graphics_utils  import compute_vertex_normals, quat_rotate, rotate_canon_to_normal
+from libs.utils.camera_utils import get_camera_position
+from libs.utils.mesh_sampling     import (
+    uniform_sampling_barycoords,
+    reweight_uvcoords_by_barycoords,
+    reweight_verts_by_barycoords,
+    sample_uvmap_by_barycoords
+    
+)
+from libs.utils.mesh_compute      import (
+    compute_face_orientation,
+    compute_face_normals
+)
+
+import warnings
+warnings.filterwarnings("ignore", message="No mtl file provided")
+warnings.filterwarnings("ignore", message="Mtl file does not exist")
+
+#-------------------------------------------------------------------------------#
+def _get_attr(obj, names):
+    for n in names:
+        if hasattr(obj, n):
+            return getattr(obj, n)
+    return None
+
+class MDIHeadAvatar(nn.Module):
+    def __init__(self, cfg, shape_params, static_offset, device='cuda'):
+        super().__init__()
+        self.cfg = cfg
+        self.uv_resolution = cfg["tex_size"]
+        self.shell_len     = float(max(cfg["normal_offset"], 1e-3)) 
+        self.rodriguez_rotation = True
+        self.max_sh_degree = 0
+        self.device = device
+        # self.device = device
+        self.optimizer = None
+        self.scheduler = None
+        self._uv_valid_mask = None
+
+        self.shape_params           = torch.tensor(shape_params)
+        self.static_offset          = torch.tensor(static_offset)
+        self.canonical_expression   = torch.zeros((1,self.cfg["n_expr"]))
+        self.canonical_pose         = torch.zeros((1,self.cfg["n_pose"]))
+        self.canonical_trans        = torch.zeros((1,3))
+
+        self._register_flame()
+        self._register_template_mesh(template_path=self.cfg["template_mesh_path"])
+
+
+        self.uv_mapper = GaussianUVMapper(flame_model=None, device=device,
+                                uvcoords=self.uvcoords, # 원래 그대로 
+                                uvfaces=self.uvfaces,
+                                tri_faces=self.faces).to(device)
+
+        mean_scaling, max_scaling, scale_init = self.get_init_scale_by_knn(self.verts_sampling) 
+
+        self.register_buffer('mean_scaling', mean_scaling)
+        self.register_buffer('max_scaling', max_scaling)
+        self.register_buffer('scale_init', scale_init)
+
+        # ---------------- UV-space geometric maps (learnable) ----------------
+        H = self.uv_resolution
+        W = self.uv_resolution
+
+        # 로그-스케일(3,H,W), xyz-델타(3,H,W), 로우 쿼터니언(4,H,W)
+        self.canon_slog = nn.Parameter(
+            torch.full((3, H, W), float(self.scale_init.item())).requires_grad_(True)
+        )
+        self.canon_xyz = nn.Parameter(
+            torch.zeros(3, H, W).requires_grad_(True)
+        )
+        self.canon_rot = nn.Parameter(
+            torch.zeros(4, H, W).requires_grad_(True)
+        )
+        self.canon_normal = nn.Parameter(
+            torch.zeros(3, H, W).requires_grad_(True)
+        )
+        self.canon_color = nn.Parameter(
+            torch.ones(1, 3, H, W).requires_grad_(True)*0.5
+        )
+        self.canon_opacity = nn.Parameter(
+            torch.ones(1, 1, H, W).requires_grad_(True)*0.5
+        )
+        with torch.no_grad():
+            # identity quat (w,x,y,z) = (1,0,0,0)
+            self.canon_rot[0].fill_(1.0)
+
+        
+        _, face_scaling_canonical    = compute_face_orientation(self.canonical_verts.squeeze(0), self.faces, return_scale=True)
+        self.register_buffer('face_scaling_canonical', face_scaling_canonical)
+
+        # self.delta_shapedirs    = torch.zeros_like(self.flame.shapedirs)
+        # self.delta_shapedirs    = nn.Parameter(self.delta_shapedirs.requires_grad_(True))
+
+        # self.delta_posedirs     = torch.zeros_like(self.flame.posedirs)
+        # self.delta_posedirs     = nn.Parameter(self.delta_posedirs.requires_grad_(True))
+
+        self.delta_vertex       = torch.zeros_like(self.flame.v_template)
+        self.delta_vertex       = nn.Parameter(self.delta_vertex.requires_grad_(True))
+
+        # self.spec_residual_gain = float(self.cfg.get("spec_residual_gain", 0.5))
+
+        self.uv_offset           = torch.zeros(1, self.uv_resolution, self.uv_resolution) # 1, w, h
+        # self.uv_offset           = nn.Parameter(self.uv_offset.requires_grad_(True)).float()
+
+        self.uv_color           = inverse_sigmoid(0.5 * torch.ones(3, self.uv_resolution, self.uv_resolution)) # feature_dim, 3, w, h
+        # self.uv_color           = nn.Parameter(self.uv_color.requires_grad_(True)).float()
+
+        self.uv_opacity         = inverse_sigmoid(0.1 * torch.ones(1, self.uv_resolution, self.uv_resolution))
+        # self.uv_opacity         = nn.Parameter(self.uv_opacity.requires_grad_(True)).float()
+
+        self.uv_normal           = torch.zeros(3, self.uv_resolution, self.uv_resolution) # 3, w, h
+        # self.uv_normal           = nn.Parameter(self.uv_normal.requires_grad_(True)).float()
+
+        # NOTE: wrap as nn.Parameter **after** setting dtype; do NOT call .float() on Parameter (it returns a plain Tensor)
+        self.uv_albedo    = nn.Parameter(
+            torch.ones(3, self.uv_resolution, self.uv_resolution, dtype=torch.float32)*0.2, requires_grad=True
+        )
+        self.uv_roughness = nn.Parameter(
+            torch.zeros(1, self.uv_resolution, self.uv_resolution, dtype=torch.float32), requires_grad=True
+        )
+        self.uv_metallic  = nn.Parameter(
+            torch.zeros(1, self.uv_resolution, self.uv_resolution, dtype=torch.float32), requires_grad=True
+        )
+        # assert isinstance(self.uv_albedo, nn.Parameter)
+        # assert isinstance(self.uv_roughness, nn.Parameter)
+        # assert isinstance(self.uv_metallic, nn.Parameter)
+
+
+        self._register_init_gaussian()
+
+        
+    def _register_flame(self):
+
+        self.flame = FlameHead(
+            shape_params         = self.cfg["n_shape"],
+            expr_params          = self.cfg["n_expr"],
+            add_teeth=True,
+        )
+        
+        canonical_verts, canonical_pose_feature, canonical_transformations = self.flame(
+            self.shape_params[None, ...],
+            self.canonical_expression,
+            self.canonical_pose[:,:3],
+            self.canonical_pose[:,3:6],
+            self.canonical_pose[:,6:9],
+            self.canonical_pose[:,9:],
+            self.canonical_trans,
+            self.static_offset,
+            # delta_shapedirs=self.delta_shapedirs,
+            # delta_posedirs=self.delta_posedirs,
+        )
+        
+        # make sure call of FLAME is successful
+        self.canonical_verts                    = canonical_verts
+        self.flame.canonical_verts              = canonical_verts.squeeze(0)
+        self.flame.canonical_pose_feature       = canonical_pose_feature
+        self.flame.canonical_transformations    = canonical_transformations
+    
+    def _register_template_mesh(self, template_path):
+
+        #----------------   load head mesh & process UV ----------------#
+        verts, faces, aux = load_obj(template_path)
+
+        uvcoords = aux.verts_uvs
+        # uvcoords = uvcoords * 2 - 1  # Normalize to [-1, 1]
+        # uvcoords[:, 1] = -uvcoords[:, 1]
+
+        uvfaces     = faces.textures_idx
+        faces       = faces.verts_idx
+
+        face_index, bary_coords = uniform_sampling_barycoords(
+            num_points    = self.uv_resolution * self.uv_resolution,
+            tex_coord     = uvcoords,
+            uv_faces      = uvfaces
+        )
+
+        uvcoords_sample = reweight_uvcoords_by_barycoords(
+            uvcoords    = uvcoords,
+            uvfaces     = uvfaces,
+            face_index  = face_index,
+            bary_coords = bary_coords
+        )
+        
+        uvcoords_sample = uvcoords_sample[...,:2]
+
+        self.register_buffer('uvcoords', uvcoords)
+        self.register_buffer('uvfaces', uvfaces)
+        self.register_buffer('faces', faces)
+        self.register_buffer('template_verts', verts)
+        self.register_buffer('face_index', face_index)
+        self.register_buffer('bary_coords', bary_coords)
+        self.register_buffer('uvcoords_sample', uvcoords_sample)
+
+        #----------------   sample points in template mesh  ----------------#
+        verts_sampling = reweight_verts_by_barycoords(
+            verts         = verts.unsqueeze(0),
+            faces         = faces,
+            face_index    = face_index,
+            bary_coords   = bary_coords
+        )
+    
+        self.register_buffer('verts_sampling', verts_sampling)
+
+        # uvcoords_sample: (N, 2) in [0,1]
+        # _register_template_mesh() 안, uv_grid 만들기 직전에 한 줄 추가
+        uvcoords_sample_flip = self.uvcoords_sample.clone()
+        uvcoords_sample_flip[..., 1] = 1.0 - uvcoords_sample_flip[..., 1]       
+        uvcoords_sample_flip[..., 0] = 1.0 - uvcoords_sample_flip[..., 0]  
+
+        uv_grid = uvcoords_sample_flip * 2.0 - 1.0            # to [-1, 1]
+        uv_grid = uv_grid.view(1, -1, 1, 2).contiguous().float()
+        self.register_buffer('uv_grid', uv_grid)
+        self.num_points = self.uv_resolution * self.uv_resolution   
+
+    def _register_init_gaussian(self):
+        # self.num_points = self.verts_sampling.shape[1]
+
+        # purely geometric 파라미터만 남기고,
+        # appearance 파라미터는 매 forward() 때 UV에서 새로 샘플한다.
+        # scales = self.scale_init[..., None].repeat(self.num_points, 3).to(self.device)
+        scale_base = (self.scale_init * self.cfg.get("init_scale_mult", 0.5))
+        scales = scale_base[..., None].repeat(self.num_points, 3)
+        rots   = torch.zeros((self.num_points, 4))
+        rots[:, 0] = 1
+
+        # ────────────────────────────────────────────────
+        # ① offset 은 ‘학습 가능한 상수’로만 둔다
+        #    (UV 텍스처에서 가져오지 않음 → 그래프 clean)
+        self._offset = nn.Parameter(
+            torch.zeros(self.num_points, 1, requires_grad=True)
+        )
+
+        # ② SH DC 용 placeholder (값은 forward 에서 매번 덮어씀)
+        self._features_dc   = nn.Parameter(
+            torch.zeros(self.num_points, 1, 3),  requires_grad=False
+        )
+        self._features_rest = torch.empty(
+            self.num_points, 0, 3, requires_grad=False
+        )
+
+        # ③ geometry-only 파라미터
+        # self._scaling  = nn.Parameter(scales, requires_grad=True)
+        # self._rotation = nn.Parameter(rots,   requires_grad=True)
+        self._scaling  = scales
+        self._rotation = rots
+
+        # 나머지 PBR 파라미터도 ‘빈 텐서 + no-grad’로 둡니다.
+        self._opacity   = torch.empty(self.num_points, 1)   # no grad
+        self._normal    = torch.empty(self.num_points, 3)
+        self._albedo    = torch.empty(self.num_points, 3)
+        self._roughness = torch.empty(self.num_points, 1)
+        self._metallic  = torch.empty(self.num_points, 1)
+
+        self.register_buffer('xyz_gradient_accum', torch.zeros(self.num_points, 1))
+        self.register_buffer('denom',              torch.zeros(self.num_points, 1))
+        self.register_buffer('max_radii2D',        torch.zeros(self.num_points))
+        # if you use this as a boolean mask during training, make it bool:
+        self.register_buffer('sample_flag',        torch.zeros(self.num_points, dtype=torch.bool))
+
+
+    def _sample_uv_features(self, feature):
+
+        # self.uv_albedo, self.uv_roughness, self.uv_metallic: (C,H,W)
+
+        def _precompute_xy_idx(H: int, W: int):
+            # self.uv_grid: (1,N,1,2) in [-1,1]
+            grid = self.uv_grid.view(1, -1, 2)[0]
+            gx, gy = grid[:, 0], grid[:, 1]
+            # align_corners=True → idx = round((g+1)/2 * (size-1))
+            x = torch.round((gx + 1.0) * 0.5 * (W - 1)).long().clamp_(0, W - 1)
+            y = torch.round((gy + 1.0) * 0.5 * (H - 1)).long().clamp_(0, H - 1)
+            return x, y
+
+        # albedo
+        C, H, W = feature.shape
+        x_idx, y_idx = _precompute_xy_idx(H, W)
+        feature_lin = feature[:, y_idx, x_idx].permute(1,0).contiguous()   # (N,3)
+
+
+        # self.uv_grid: (1,N,1,2) in [-1,1]
+        grid = self.uv_grid  # (1,N,1,2)
+        # bilinear sampling
+        val = F.grid_sample(feature[None], grid, mode='bilinear', padding_mode='zeros', align_corners=True)  # (1,C,N,1)
+        # reshape to (N,C)
+        return val.squeeze(0).squeeze(-1).permute(1,0).contiguous()
+    
+
+    def _sample_uv_pbr_features(self):
+
+        # self.uv_albedo, self.uv_roughness, self.uv_metallic: (C,H,W)
+
+        def _precompute_xy_idx(H: int, W: int):
+            # self.uv_grid: (1,N,1,2) in [-1,1]
+            grid = self.uv_grid.view(1, -1, 2)[0]
+            gx, gy = grid[:, 0], grid[:, 1]
+            # align_corners=True → idx = round((g+1)/2 * (size-1))
+            x = torch.round((gx + 1.0) * 0.5 * (W - 1)).long().clamp_(0, W - 1)
+            y = torch.round((gy + 1.0) * 0.5 * (H - 1)).long().clamp_(0, H - 1)
+            return x, y
+
+        # albedo
+        C, H, W = self.uv_albedo.shape
+        x_idx, y_idx = _precompute_xy_idx(H, W)
+        albedo_lin = self.uv_albedo[ :, y_idx, x_idx ].transpose(0, 1).contiguous()   # (N,3)
+
+        # roughness
+        Cr, Hr, Wr = self.uv_roughness.shape
+        if (Hr, Wr) != (H, W):
+            xr, yr = _precompute_xy_idx(Hr, Wr)
+        else:
+            xr, yr = x_idx, y_idx
+        roughness_lin = self.uv_roughness[ :, yr, xr ].transpose(0, 1).contiguous()    # (N,1)
+
+        # metallic
+        Cm, Hm, Wm = self.uv_metallic.shape
+        if (Hm, Wm) != (H, W):
+            xm, ym = _precompute_xy_idx(Hm, Wm)
+        else:
+            xm, ym = x_idx, y_idx
+        metallic_lin = self.uv_metallic[ :, ym, xm ].transpose(0, 1).contiguous()      # (N,1)
+
+        # 범위 리매핑
+        rmax, rmin = 1.0, 0.04
+        roughness_lin = roughness_lin * (rmax - rmin) + rmin
+
+        return albedo_lin, roughness_lin, metallic_lin
+    
+    def _sample_uv_features_from(self, uv_maps, keys=None):
+        """
+        uv_maps: dict of (B=1,C,H,W) 텐서들. 반환은 {key: (N,C)}
+        """
+        # ★ self.uv_grid: (1,N,1,2) in [-1,1], align_corners=True 가정
+        #    한 번만 N→픽셀 인덱스로 변환해서 모든 텍스처에 공통 사용
+        _computed_idx = {"x": None, "y": None, "HW": None}
+
+        def _get_xy_idx_for(tex4):
+            # tex4: (1,C,H,W)
+            H, W = tex4.shape[-2:]
+            if (_computed_idx["HW"] is None) or (_computed_idx["HW"] != (H, W)):
+                # (1,N,1,2) → (N,2)
+                grid = self.uv_grid.view(1, -1, 2)[0]     # NDC [-1,1]
+                gx = grid[:, 0]
+                gy = grid[:, 1]
+                # align_corners=True: idx = round( (g+1)/2 * (size-1) )
+                x = torch.round((gx + 1.0) * 0.5 * (W - 1)).long()
+                y = torch.round((gy + 1.0) * 0.5 * (H - 1)).long()
+                x = x.clamp_(0, W - 1)
+                y = y.clamp_(0, H - 1)
+                _computed_idx.update({"x": x, "y": y, "HW": (H, W)})
+            return _computed_idx["x"], _computed_idx["y"]
+
+        def samp4(tex4, mask4=None):
+            # tex4: (1,C,H,W), mask4: (1,1,H,W) or None
+            x_idx, y_idx = _get_xy_idx_for(tex4)
+
+            if mask4 is None:
+                # 최근접 픽셀 인덱싱으로 그대로 읽기 → (C,N) → (N,C)
+                out = tex4[0, :, y_idx, x_idx].transpose(0, 1).contiguous()
+            else:
+                # 값과 마스크를 각각 최근접 인덱싱 후 정규화
+                val = (tex4 * mask4)[0, :, y_idx, x_idx]             # (C,N)
+                wei =  mask4[y_idx, x_idx]                     # (1,N)
+                out = (val / (wei + 1e-8)).transpose(0, 1).contiguous()
+            return out  # (N,C)
+
+        sampled = {}
+        if keys is None:
+            keys = [
+                "features_dc_logit", "opacity_logit", "features_dc", "opacity",
+                "normal","dnormal","dnormal_spec",
+                "albedo", "roughness", "metallic", "offset",
+                "dpos", "dslog", "drot",
+                "pos", "slog", "rot",
+                "shading_d_logit", "shading_d", 
+                "shading_s_logit", "shading_s",
+                "vis_logit", "visibility"
+            ]
+
+        # 유효 영역 마스크 준비. 값 맵과 해상도 동일해야 함: (1,1,H,W)
+        mask4 = self._uv_valid_mask if isinstance(self._uv_valid_mask, torch.Tensor) else None
+
+        for k in keys:
+            if (uv_maps is not None) and (k in uv_maps) and (uv_maps[k] is not None):
+                # appearance 맵과 기하 절대값은 마스크 적용 추천
+                if k in ["pos", "normal", "albedo", "roughness", "metallic", "offset", "features_dc", "opacity"]:
+                    sampled[k] = samp4(uv_maps[k], mask4=mask4)
+                else:
+                    # 델타류는 네트워크 전역 예측이 많아 마스크 없이도 OK. 필요시 mask4로 바꿔도 됨
+                    sampled[k] = samp4(uv_maps[k], mask4=None)
+        return sampled
+
+    def forward_geometry(self, viewpoint_cam):
+        # ---- FLAME ----
+        verts, _, _ = self.flame(
+            viewpoint_cam.flame_param["shape"][None, ...],
+            viewpoint_cam.flame_param["expr"],
+            viewpoint_cam.flame_param["rotation"],
+            viewpoint_cam.flame_param["neck_pose"],
+            viewpoint_cam.flame_param["jaw_pose"],
+            viewpoint_cam.flame_param["eyes_pose"],
+            viewpoint_cam.flame_param["translation"],
+            static_offset=viewpoint_cam.flame_param["static_offset"],
+            # delta_shapedirs=self.delta_shapedirs,
+            # delta_posedirs=self.delta_posedirs,
+            delta_vertex=self.delta_vertex
+        )
+
+        # ---------- Build (expr + pose + translation) → flame_cond (B=1, 118) ----------
+        device = verts.device
+        # expression
+        expr = None
+        if isinstance(viewpoint_cam.flame_param, dict):
+            expr = viewpoint_cam.flame_param.get("expr", viewpoint_cam.flame_param.get("expression", None))
+        else:
+            expr = getattr(viewpoint_cam.flame_param, "expr",
+                getattr(viewpoint_cam.flame_param, "expression", None))
+        # pose parts
+        pose_parts = []
+        if isinstance(viewpoint_cam.flame_param, dict):
+            for k in ["rotation", "neck_pose", "jaw_pose", "eyes_pose", "translation"]:
+                v = viewpoint_cam.flame_param.get(k, None)
+                if v is not None:
+                    pose_parts.append(v.view(1, -1))
+        else:
+            for k in ["rotation", "neck_pose", "jaw_pose", "eyes_pose", "translation"]:
+                v = getattr(viewpoint_cam.flame_param, k, None)
+                if v is not None:
+                    pose_parts.append(v.view(1, -1))
+        pose = torch.cat(pose_parts, dim=1) if len(pose_parts) > 0 else None
+
+        expr = expr.view(1, -1)
+        pose = pose.view(1, -1)
+
+        flame_cond = torch.cat([expr, pose], dim=1)
+        flame_cond = flame_cond.float().detach()
+        
+        face_orien_mat, face_scaling = compute_face_orientation(verts, self.faces, return_scale=True)
+        face_normals = compute_face_normals(verts, self.faces)
+
+        # per-vertex normal (V,3) -> UV 샘플 포인트(N,3)
+        verts_normal = compute_vertex_normals(verts.squeeze(0), self.faces)          # (V,3)
+
+        scaling_ratio       = face_scaling / self.face_scaling_canonical
+        flame_scaling_ratio = scaling_ratio[:, self.face_index]
+        flame_orien_mat     = face_orien_mat[:, self.face_index]
+        flame_orien_quat    = matrix_to_quaternion(flame_orien_mat)
+        flame_normals       = face_normals[:, self.face_index]
+        verts_normal = compute_vertex_normals(verts.squeeze(0), self.faces) 
+
+        # base_pos = reweight_verts_by_barycoords(
+        #     verts=verts,
+        #     faces=self.faces,
+        #     face_index=self.face_index,
+        #     bary_coords=self.bary_coords
+        # )
+        # base_normal = reweight_verts_by_barycoords(
+        #     verts=verts_normal.unsqueeze(0),   # (1,V,3)
+        #     faces=self.faces,
+        #     face_index=self.face_index,
+        #     bary_coords=self.bary_coords
+        # )                  
+
+        # UV 래스터 맵 생성
+        uv_base, uv_valid_mask = self.uv_mapper.unwrap_to_uv_rasterize(
+            vertex_values=torch.concat([verts[0], verts_normal], dim=1), texture_resolution=self.uv_resolution)
+        uv_base = uv_base.permute(2,0,1).unsqueeze(0) # (1,C,H,W)
+        uv_base_pos, uv_base_normal, uv_flame_orient = uv_base[:,:3], uv_base[:,3:6], uv_base[:,6:]
+
+        # -------- Camera UV maps for per-pixel appearance prediction --------
+        # cam_pos: (1,3,1,1)
+        cam_pos = get_camera_position(viewpoint_cam, device=self.device)
+        if cam_pos.dim() == 2:
+            cam_pos = cam_pos.view(1, 3, 1, 1)
+        elif cam_pos.dim() == 1:
+            cam_pos = cam_pos.view(1, 3, 1, 1)
+        # pos_val[0]: (N,3) → (1,3,H,W)
+        H = W = self.uv_resolution
+
+        # reg_terms = {}
+        # if self.delta_vertex is not None: reg_terms['delta_vertex'] = (self.delta_vertex ** 2).mean()
+
+        return {
+            'verts': verts,
+            'faces': self.faces,
+            'flame_scaling_ratio': flame_scaling_ratio,
+            'flame_orien_quat': flame_orien_quat,
+            'flame_normals': flame_normals,
+            'verts_normal': verts_normal,  # (V,3)
+            'uv_valid_mask': uv_valid_mask,
+
+            'params': flame_cond,
+            # 'reg_terms' : reg_terms,
+            'cam_pos': cam_pos,
+            'uv_base_pos': uv_base_pos,
+            'uv_base_normal': uv_base_normal,
+
+            'canon_xyz': self.canon_xyz,
+            'canon_slog':self.canon_slog,
+            'canon_rot': self.canon_rot,
+            'canon_color':self.canon_color,
+            'canon_opacity':self.canon_opacity,
+            'canon_normal': self.canon_normal,
+        }
+
+    def _bary_reweight_attr(self, attr_verts: torch.Tensor) -> torch.Tensor:
+        """
+        Map a per-vertex attribute (V, D) onto our N UV samples via face_index & bary_coords.
+        Returns (N, D).
+        """
+        faces = self.faces.long()                 # (F,3)
+        f_attr = attr_verts[faces]                # (F,3,D)
+        sel    = f_attr[self.face_index.long()]   # (N,3,D)
+        bc     = self.bary_coords[..., None]      # (N,3,1)
+        out    = (sel * bc).sum(dim=1)            # (N,D)
+        return out
+
+    def build_canonical_gaussian(self, geom, uv_maps=None):
+
+        self._uv_valid_mask = geom.get('uv_valid_mask', None)   # ★ mask 보관
+        # Always sample PBR features at the top (only once)
+        albedo_lin, roughness_lin, metallic_lin = self._sample_uv_pbr_features()
+
+        eps_floor = 0.01
+        sampled_app = self._sample_uv_features_from(geom, keys=["canon_color", "canon_opacity"])
+        # ===== Appearance =====
+        
+        # color_logit = self._sample_uv_features(geom["canon_color"][0]) 
+        # opacity_logit_raw = self._sample_uv_features(geom["canon_opacity"][0])
+
+        # color logits
+        color_logit = sampled_app['canon_color']
+        # opacity logits
+        opacity_logit_raw = sampled_app['canon_opacity']
+
+        prob = torch.sigmoid(opacity_logit_raw)
+
+        prob = prob * (1.0 - eps_floor) + eps_floor
+        prob = prob.clamp(eps_floor, 1 - 0.00001)
+        opacity_logit_eff = inverse_sigmoid(prob)
+        
+
+        # ===== Gaussian container =====
+        gaussian = GaussianModel(sh_degree=0)
+        gaussian._features_dc   = color_logit[:, None, :]  # (N,1,3)
+        gaussian._features_rest = torch.empty(color_logit.shape[0], 0, 3, requires_grad=False)
+        gaussian._opacity       = opacity_logit_eff
+        gaussian._albedo        = albedo_lin
+        gaussian._roughness     = roughness_lin
+        gaussian._metallic      = metallic_lin
+
+        # ===== Geometry =====
+        sampled = self._sample_uv_features_from(uv_maps, 
+                                                keys=["pos", "slog", "rot","normal"])
+        gaussian._xyz = sampled['pos']
+
+        # --- after ---
+        LOG_S_MIN, LOG_S_MAX = -8.0, -0.1  # exp() 기준 ≈ [3.4e-4, 20.1]
+        slog = sampled['slog'].clamp(LOG_S_MIN, LOG_S_MAX)
+        gaussian._scaling = slog
+        # gaussian._scaling = sampled['slog']
+
+        gaussian._rotation = sampled['rot']
+
+        gaussian._normal = sampled['normal']
+
+        # -------------------------
+        # Regularization terms
+        # -------------------------
+        # 유효 UV 마스크가 있으면 그 위에서 평균. 없으면 전 픽셀
+
+
+        mask = geom.get("uv_valid_mask", None)  # (1,1,H,W) or (B,1,H,W)
+        if mask is not None:
+            m = mask.float().clamp(min=0.0, max=1.0)
+            m = m.expand(1, 1, self.uv_resolution, self.uv_resolution)
+
+            def _smooth_loss_on_mask(x):
+                """
+                x: (B,C,H,W) uv map
+                return: smoothness loss (scalar)
+                """
+                dx = x[:, :, :, 1:] - x[:, :, :, :-1]       # horizontal gradient
+                dy = x[:, :, 1:, :] - x[:, :, :-1, :]       # vertical gradient
+
+                mx = m[:, :, :, 1:] * m[:, :, :, :-1]       # valid mask for dx
+                my = m[:, :, 1:, :] * m[:, :, :-1, :]       # valid mask for dy
+
+                loss_x = (dx.pow(2) * mx).sum() / (mx.sum() + 1e-8)
+                loss_y = (dy.pow(2) * my).sum() / (my.sum() + 1e-8)
+
+                return 0.5 * (loss_x + loss_y)
+        else:
+            def _smooth_loss_on_mask(x):
+                dx = x[:, :, :, 1:] - x[:, :, :, :-1]
+                dy = x[:, :, 1:, :] - x[:, :, :-1, :]
+                return 0.5 * (dx.pow(2).mean() + dy.pow(2).mean())
+
+        pos_smt = _smooth_loss_on_mask(uv_maps['pos'].abs()).mean(dim=0, keepdim=True)
+        slog_smt = _smooth_loss_on_mask(uv_maps['slog'].abs()).mean(dim=0, keepdim=True)
+        rot_smt = _smooth_loss_on_mask(uv_maps['rot'].abs()).mean(dim=0, keepdim=True)
+        normal_smt = _smooth_loss_on_mask(uv_maps['normal'].abs()).mean(dim=0, keepdim=True)
+
+        # -------------------------
+        # UV mapping regularizers to preserve neighborhood ordering
+        # -------------------------
+        def _uv_cell_grads(x: torch.Tensor):
+            """
+            x: (B,C,H,W)
+            Returns forward finite differences over each UV cell:
+              du: right neighbor minus left  (B,C,H-1,W-1)
+              dv: bottom neighbor minus top (B,C,H-1,W-1)
+            """
+            du = x[:, :, :-1, 1:] - x[:, :, :-1, :-1]
+            dv = x[:, :, 1:, :-1] - x[:, :, :-1, :-1]
+            return du, dv
+
+        # Prepare inputs
+        pos_map  = uv_maps['pos']      # (B=1,3,H,W)
+        base_pos = geom['uv_base_pos'] # (B=1,3,H,W)
+        base_n   = F.normalize(geom['uv_base_normal'], dim=1, eps=1e-6)  # (B=1,3,H,W)
+
+        # Build per-pixel TBN from base normal
+        up   = torch.tensor([0.0, 1.0, 0.0], device=base_n.device, dtype=base_n.dtype).view(1,3,1,1).expand_as(base_n)
+        side = torch.tensor([1.0, 0.0, 0.0], device=base_n.device, dtype=base_n.dtype).view(1,3,1,1).expand_as(base_n)
+        use_side = (base_n.mul(up).sum(1, keepdim=True).abs() > 0.99).expand_as(base_n)
+        a = torch.where(use_side, side, up)
+        t_full = F.normalize(torch.cross(a, base_n, dim=1), dim=1, eps=1e-6)
+        b_full = F.normalize(torch.cross(base_n, t_full, dim=1), dim=1, eps=1e-6)
+
+        # Cell-aligned versions (H-1, W-1)
+        n_cell = base_n[:, :, :-1, :-1]
+        t_cell = t_full[:, :, :-1, :-1]
+        b_cell = b_full[:, :, :-1, :-1]
+
+        # Finite differences for current mapping and base mapping
+        du,  dv  = _uv_cell_grads(pos_map)
+        du0, dv0 = _uv_cell_grads(base_pos)
+
+        # Orientation preservation: det(J) ~ (du x dv) · n should be positive
+        ori = torch.sum(torch.cross(du, dv, dim=1) * n_cell, dim=1, keepdim=True)  # (B,1,H-1,W-1)
+        uv_flip = F.relu(-ori)  # penalize only flips (negative orientation)
+
+        # Area distortion (log-space) relative to base mapping
+        area  = torch.linalg.norm(torch.cross(du,  dv,  dim=1), dim=1, keepdim=True) + 1e-8
+        area0 = torch.linalg.norm(torch.cross(du0, dv0, dim=1), dim=1, keepdim=True) + 1e-8
+        area_ratio = torch.log(area / area0)
+        uv_area = area_ratio.pow(2)
+
+        # Direction alignment: du // t, dv // b
+        du_n = F.normalize(du,  dim=1, eps=1e-6)
+        dv_n = F.normalize(dv,  dim=1, eps=1e-6)
+        t_n  = F.normalize(t_cell, dim=1, eps=1e-6)
+        b_n  = F.normalize(b_cell, dim=1, eps=1e-6)
+        cos_ut = F.cosine_similarity(du_n, t_n, dim=1, eps=1e-6).unsqueeze(1)
+        cos_vb = F.cosine_similarity(dv_n, b_n, dim=1, eps=1e-6).unsqueeze(1)
+        uv_dir = (1.0 - cos_ut).pow(2) + (1.0 - cos_vb).pow(2)
+
+        # Apply mask on cell domain if available
+        if mask is not None:
+            # Build cell-consistent mask by AND-ing three corners of each cell
+            m_cell = m[:, :, :-1, :-1] * m[:, :, :-1, 1:] * m[:, :, 1:, :-1]
+            uv_flip = (uv_flip * m_cell).sum() / (m_cell.sum() + 1e-8)
+            uv_area = (uv_area * m_cell).sum() / (m_cell.sum() + 1e-8)
+            uv_dir  = (uv_dir  * m_cell).sum() / (m_cell.sum() + 1e-8)
+        else:
+            uv_flip = uv_flip.mean()
+            uv_area = uv_area.mean()
+            uv_dir  = uv_dir.mean()
+
+        reg_terms = {
+            # Smoothness terms
+            "pos_smt":          pos_smt,
+            "slog_smt":         slog_smt,
+            "rot_smt":          rot_smt,
+            "normal_smt":       normal_smt,
+            # UV mapping regularizers (ordering + distortion control)
+            "uv_flip":          uv_flip * 0.01,   # strong penalty for flips
+            "uv_area":          uv_area * 0.01,    # moderate area distortion control
+            "uv_dir":           uv_dir  * 0.01,    # encourage du//t and dv//b
+        }
+
+
+        return {
+            'sampled': sampled,
+            'scale': torch.exp(gaussian._scaling),                 # (N,3)
+            'raw_rot': quaternion_to_axis_angle(gaussian._rotation),  # (N,3)
+            'gaussian': gaussian,
+            'verts': geom['verts'],
+            'faces': geom['faces'],
+            'reg_terms': reg_terms,
+        }
     
     def build_gaussian(self, geom, uv_maps=None):
 
@@ -511,7 +1346,7 @@ class MDIHeadAvatar(nn.Module):
         eps_floor = 0.01
         # ===== Appearance =====
         sampled = self._sample_uv_features_from(uv_maps)
-
+        eps = 1e-4
         # color logits
         color_logit = sampled['features_dc_logit']
 
@@ -837,12 +1672,16 @@ class MDIHeadAvatar(nn.Module):
             add_param(groups, "canon_xyz",  "canon_xyz",  cfg("lr_uv_canon",     1e-5))
             add_param(groups, "canon_slog", "canon_slog", cfg("lr_uv_canon",     1e-5))
             add_param(groups, "canon_rot",  "canon_rot",  cfg("lr_uv_canon",     1e-5))
+            add_param(groups, "canon_color",  "canon_color",  10*cfg("lr_uv_canon",     1e-5))
+            add_param(groups, "canon_opacity",  "canon_opacity",  10*cfg("lr_uv_canon",     1e-5))
+            add_param(groups, "canon_normal",  "canon_normal",  10*cfg("lr_uv_canon",     1e-5))
 
         elif stage == "pbr":
             pbr_lr = float(cfg("pbr_tex_lr", 1e-3))
             add_param(groups, "albedo",    "uv_albedo",    pbr_lr)
             add_param(groups, "roughness", "uv_roughness", pbr_lr)
             add_param(groups, "metallic",  "uv_metallic",  pbr_lr)
+            add_param(groups, "normal",  "canon_normal",  pbr_lr)
             if len(groups) == 0:
                 raise RuntimeError("[training_setup] No PBR parameters found.")
 
@@ -852,7 +1691,9 @@ class MDIHeadAvatar(nn.Module):
             add_param(groups, "canon_xyz",  "canon_xyz",  cfg("lr_uv_canon",     1e-5))
             add_param(groups, "canon_slog", "canon_slog", cfg("lr_uv_canon",     1e-5))
             add_param(groups, "canon_rot",  "canon_rot",  cfg("lr_uv_canon",     1e-5))
-            # pbr
+            add_param(groups, "canon_color",  "canon_color",  10*cfg("lr_uv_canon",     1e-5))
+            add_param(groups, "canon_opacity",  "canon_opacity",  10*cfg("lr_uv_canon",     1e-5))
+            add_param(groups, "canon_normal",  "canon_normal",  100*cfg("lr_uv_canon",     1e-5))
             pbr_lr = float(cfg("pbr_tex_lr", 1e-1))
             add_param(groups, "albedo",    "uv_albedo",    pbr_lr)
             add_param(groups, "roughness", "uv_roughness", pbr_lr)
@@ -868,3 +1709,4 @@ class MDIHeadAvatar(nn.Module):
 
         sched_fn = cfg_train.get("lr_scheduler", None)
         self.scheduler = sched_fn(opt) if callable(sched_fn) else None
+

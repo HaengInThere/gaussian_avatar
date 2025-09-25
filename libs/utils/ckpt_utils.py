@@ -96,6 +96,9 @@ def model_training_setup(args, cfg_training: dict, head_model, uv_net, env_light
     return start_iter
 
 
+import torch
+import torch.nn as nn
+
 def force_load_model_from_ckpt(
     model: nn.Module,
     ckpt_sd: dict,
@@ -121,43 +124,76 @@ def force_load_model_from_ckpt(
 
     ckpt_sd = normalize_keys(ckpt_sd, model_sd.keys())
 
-    loaded, partial, missing, mismatched, unexpected = [], [], [], [], []
+    loaded, partial, missing, mismatched, unexpected, overwrited = [], [], [], [], [], []
 
     def parent_and_attr(root: nn.Module, dotted: str):
         parts = dotted.split("."); mod = root
         for p in parts[:-1]: mod = getattr(mod, p)
         return mod, parts[-1]
 
+    param_names = {n for n, _ in model.named_parameters()}
+    buffer_names = {n for n, _ in model.named_buffers()}
+
+    # 대표 디바이스/타입 추정
+    try:
+        rep = next(model.parameters())
+        default_device, default_dtype = rep.device, rep.dtype
+    except StopIteration:
+        default_device, default_dtype = torch.device("cpu"), torch.float32
+
     with torch.no_grad():
         for name, target in model_sd.items():
             if name not in ckpt_sd:
                 missing.append(name); continue
-            src = ckpt_sd[name].to(device=target.device, dtype=target.dtype)
+
+            parent, attr = parent_and_attr(model, name)
+            exists = getattr(parent, attr, None)
+
+            # 현재 변수의 device, dtype을 기준으로 맞춤
+            if isinstance(exists, (nn.Parameter, torch.Tensor)):
+                tgt_device, tgt_dtype = exists.device, exists.dtype
+            else:
+                tgt_device, tgt_dtype = default_device, default_dtype
+
+            # ckpt 텐서를 모델 변수의 device, dtype으로 변환
+            src = ckpt_sd[name].to(device=tgt_device, dtype=tgt_dtype)
+
             if target.shape == src.shape:
-                parent, attr = parent_and_attr(model, name)
-                cur = getattr(parent, attr, None)
-                if isinstance(cur, (nn.Parameter, torch.Tensor)):
+                if isinstance(exists, (nn.Parameter, torch.Tensor)):
                     getattr(parent, attr).data.copy_(src); loaded.append(name)
                 else:
+                    # 기존 속성이 없거나 버퍼가 아니면 버퍼로 등록
                     parent.register_buffer(attr, src.clone(), persistent=True); loaded.append(name)
             else:
                 mismatched.append((name, tuple(src.shape), tuple(target.shape)))
-                if allow_partial:
+                if allow_partial and isinstance(exists, (nn.Parameter, torch.Tensor)):
                     n = min(target.numel(), src.numel())
-                    target.view(-1)[:n].copy_(src.view(-1)[:n]); partial.append(name)
+                    getattr(parent, attr).data.view(-1)[:n].copy_(src.view(-1)[:n]); partial.append(name)
+                else:
+                    # shape 교체. dtype, device는 현재 변수 기준을 유지
+                    src_t = src.detach()  # 이미 tgt_device, tgt_dtype로 변환됨
+                    if name in param_names:
+                        setattr(parent, attr, nn.Parameter(src_t.clone(), requires_grad=True))
+                    elif name in buffer_names:
+                        if hasattr(parent, attr):
+                            delattr(parent, attr)
+                        parent.register_buffer(attr, src_t.clone(), persistent=True)
+                    else:
+                        setattr(parent, attr, src_t.clone())
+                    overwrited.append(name)
 
         for k in ckpt_sd.keys():
             if k not in model_sd: unexpected.append(k)
 
     if verbose:
-        print(f"[force_load] loaded={len(loaded)} partial={len(partial)} missing={len(missing)} mismatched={len(mismatched)} unexpected={len(unexpected)}")
+        print(f"[force_load] loaded={len(loaded)} partial={len(partial)} missing={len(missing)} mismatched={len(mismatched)} unexpected={len(unexpected)} OVERWRITED={len(overwrited)}")
         if verbose >= 2 and (mismatched or missing or unexpected):
             if mismatched: print("[force_load] mismatched (name, ckpt, model):", mismatched[:20], "..." if len(mismatched) > 20 else "")
             if missing:    print("[force_load] missing:", missing[:20], "..." if len(missing) > 20 else "")
             if unexpected: print("[force_load] unexpected:", unexpected[:20], "..." if len(unexpected) > 20 else "")
     if strict and (missing or mismatched):
         raise RuntimeError(f"Strict load failed. missing={len(missing)}, mismatched={len(mismatched)}")
-    return {"loaded": loaded, "partial": partial, "missing": missing, "mismatched": mismatched, "unexpected": unexpected}
+    return {"loaded": loaded, "partial": partial, "missing": missing, "mismatched": mismatched, "unexpected": unexpected, "overwrited": overwrited}
 
 
 

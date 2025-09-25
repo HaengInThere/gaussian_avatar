@@ -5,6 +5,7 @@ from argparse import ArgumentParser
 from tqdm import tqdm
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torchvision.utils import save_image
 # torch.cuda.empty_cache()
 
@@ -17,7 +18,7 @@ from libs.dataset.dataloader import MDIDataMultiview
 
 # import torch.multiprocessing as mp
 
-from libs.models.mdi_head_avatar import MDIHeadAvatar
+from libs.models.mdi_head_avatar_v1 import MDIHeadAvatar
 from libs.utils.loss import PBRAvatarLoss, psnr, error_map, l1_loss, ssim
 from libs.utils.general_utils import load_to_gpu
 from libs.utils.ckpt_utils import save_full_checkpoint, model_training_setup, build_lr_scheduler
@@ -137,7 +138,7 @@ def main(args):
     with open(args.config, 'r') as f:
         cfg = yaml.load(f, Loader=yaml.FullLoader)
 
-    # torch.cuda.set_device(2)
+    torch.cuda.set_device(3)
     device="cuda"
     cfg_train = cfg["training"]
 
@@ -188,8 +189,9 @@ def main(args):
         load_to_gpu(viewpoint_cam, device)
         geom = head_model.forward_geometry(viewpoint_cam)
 
-        feat_uv_dict = uv_net(geom)
-        d3_output = head_model.build_gaussian(geom, uv_maps=feat_uv_dict)
+        # Canonical training 
+        feat_uv_dict = uv_net.forward_canon_geo(geom)
+        d3_output = head_model.build_canonical_gaussian(geom, uv_maps=feat_uv_dict)
         render_output = render_base(viewpoint_cam, d3_output["gaussian"], background)
 
         loss_output = criterions(render_output, d3_output, viewpoint_cam, background, device, train_normal=False)
@@ -207,6 +209,7 @@ def main(args):
         if iteration==1 or iteration % 1000 == 0:
             tmp_image = torch.cat([render_output['render'], viewpoint_cam.original_image], dim=-1)
             save_image(tmp_image, f'{output_path}/img_log_{iteration:06d}.png')
+            save_image(head_model.canon_color, f'{output_path}/uv_color_{iteration:06d}.png')
             
         #------------------------ do gaussian maintain ------------------------#
         head_model._add_densification_stats(viewspace_points, visibility_filter)
@@ -314,7 +317,7 @@ if __name__=="__main__":
     # parser.add_argument("--base_path", default="/hdd1/DB/MDI/250814/KSM_B_TRACK")
     parser.add_argument("--base_path", default="/hdd1/DB/nersemble_export/nersemble_export/UNION_226") 
     parser.add_argument("--lgt_type", default=None) # cube or hdr
-    parser.add_argument("--output_base_path", default="./output/track")
+    parser.add_argument("--output_base_path", default="./output/track_256")
     parser.add_argument("--version", default="final_gt_normal")
     parser.add_argument("--resume_checkpoint", default=None, help="Path to a training checkpoint (.pt) to resume from")
     args, extras = parser.parse_known_args()

@@ -468,103 +468,13 @@ class PBRAvatarLoss(nn.Module):
         out["loss"] += scale_regu * 0.01
 
         r = d3_output["reg_terms"]
-        out["loss_reg"] = (
-            1e-2*r["canon_l1"] + 
-            1e-3*r["dpos_l2"] + 
-            # 1e-4*r["dslog_l2"] + 
-            # 1e-4*r["dnormal_l2"]
-        + 1e-4*r["drot_identity"]
-        # + 1e-4*r["tv_dpos"] + 1e-4*r["tv_dslog"] + 1e-4*r["tv_drot"]
-        # + 1e-4*r["slog_softbound"]
-        )
+        loss_reg = 0.0
+        for key, w in r.items():
+            if key in r and r[key] is not None:
+                loss_reg = loss_reg + r[key]
+
+        out["loss_reg"] = loss_reg
         out["loss"] += out["loss_reg"]
-
-        return out
-
-
-    def forward_cube(self, render_pbr_output, render_output, d3_output, viewpoint_cam, background, light_map=None, train_normal=False):
-        ground_truth = viewpoint_cam.original_image
-        mask_image = viewpoint_cam.original_mask
-
-        gt_image     = ground_truth.unsqueeze(0)        # torch.Size([1, 3, 512, 512])
-        alpha_mask   = mask_image.unsqueeze(0)
-        gt_image = (gt_image * alpha_mask + background[:, None, None] * (1.0 - alpha_mask)).clamp(0.0, 1.0)
-
-        gt_albedo = viewpoint_cam.original_albedo
-        gt_roughness = viewpoint_cam.original_roughness
-        gt_metallic = viewpoint_cam.original_metallic
-
-        render_image_pbr = render_pbr_output['render'].permute(2,0,1).unsqueeze(0)   # torch.Size([1, 3, 512, 512])
-        normal_image = render_output["normal"].unsqueeze(0)
-
-        def _down(x, size=256):
-            H, W = x.shape[-2:]
-            if max(H, W) <= size:
-                return x
-            return F.interpolate(x, size=size, mode='area')
-        
-        I_pred_small = _down(render_image_pbr)
-        I_gt_small   = _down(gt_image)
-        
-        # Initialize the loss
-        loss = self.get_rgb_loss(render_image_pbr, gt_image) * 0.8
-        out = {'loss': loss, 'rgb_loss': loss}
-        
-        dssim_loss = self.get_dssim_loss(I_pred_small, I_gt_small)
-        out['ssim'] = dssim_loss
-        out['loss'] += dssim_loss * 0.2
-
-        lpips_loss = self.get_lpips_loss(I_pred_small, I_gt_small)
-        out['lpips'] = dssim_loss
-        out['loss'] += lpips_loss.squeeze() * 0.2
-
-        if viewpoint_cam.original_normal is not None and train_normal:
-            gt_normal = viewpoint_cam.original_normal * 2 - 1
-            gt_normal = gt_normal.unsqueeze(0)
-            gt_normal = (gt_normal * alpha_mask + background[:, None, None] * (1.0 - alpha_mask))
-
-            n_pred_small = _down(normal_image)
-            n_gt_small   = _down(gt_normal)
-
-            normal_loss = self.get_normal_loss(
-                normal_image,      # (B,3,H,W), [-1,1]
-                gt_normal,         # (B,3,H,W), [0,1]
-                mask=alpha_mask,   # (B,H,W)x
-                mode="cos"   # sign-invariant to avoid back-face flips
-            )
-            out["normal_loss"] = normal_loss
-            out["loss"] += normal_loss * 1.0
-
-            lpips_normal_loss = self.get_lpips_loss(n_pred_small, n_gt_small)
-            out['lpips_normal'] = lpips_normal_loss
-            out['loss'] += lpips_normal_loss.squeeze() * 0.2
-
-            # --- dynamic geometry magnitude regularizers (keep small at start) ---
-            w_reg_dnormal    = self.weight.get("reg_dnormal", 0.1)
-            if isinstance(d3_output, dict) and ('reg_terms' in d3_output):
-                regs = d3_output['reg_terms']
-
-                if 'dnormal' in regs:
-                    out['dnormal_spec'] = regs['dnormal_spec']
-                    out['dnormal_spec_mag'] = regs['dnormal_spec_mag']
-                    out['loss'] += w_reg_dnormal * regs['dnormal_spec'] \
-                                + w_reg_dnormal * regs['dnormal_spec_mag']
-
-        # Light loss
-        if light_map is not None:
-            if hasattr(light_map, 'light_maps') and hasattr(light_map, 'global_scale'):
-                l_total, l_stats = self.light_mix_consistency_loss(light_map)
-                out.update(l_stats)
-                out['loss'] += l_total
-            elif hasattr(light_map, 'env_base'):
-                light_reg_loss = self.lightmap_reg_loss(light_map.env_base)
-                out['light_reg'] = light_reg_loss
-                out['loss'] += light_reg_loss
-
-                
-        # albedo_reg = ((d3_output['gaussian']._albedo - 0.1) ** 2).mean()
-        # out['albedo_reg'] = albedo_reg
-        # out['loss'] += out['albedo_reg'] * 0.01
 
         return out
 
@@ -660,6 +570,14 @@ class PBRAvatarLoss(nn.Module):
         # albedo_reg = ((d3_output['gaussian']._albedo - 0.1) ** 2).mean()
         # out['albedo_reg'] = albedo_reg
         # out['loss'] += out['albedo_reg'] * 0.01
+        r = d3_output["reg_terms"]
+        loss_reg = 0.0
+        for key, w in r.items():
+            if key in r and r[key] is not None:
+                loss_reg = loss_reg + r[key]
+
+        out["loss_reg"] = loss_reg
+        out["loss"] += out["loss_reg"]
 
         return out
 

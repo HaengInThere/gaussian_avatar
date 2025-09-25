@@ -15,7 +15,7 @@ import torchvision.transforms as T
 from torchvision.transforms.functional import to_tensor
 from .renderutils import diffuse_cubemap, specular_cubemap
 from libs.utils.graphics_utils import srgb_to_rgb, rgb_to_srgb
-from libs.utils.image_utils import read_hdr
+# from libs.utils.image_utils import read_hdr
 
 def cube_to_dir(s: int, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     if s == 0:
@@ -269,6 +269,21 @@ class DirectLightMap(nn.Module):
     def set_lidx(self, i: int):
         self.lidx = int(i)
 
+    def set_optimizable_light(self, H=64, train_lights=True):
+
+        self.base = torch.ones(1, 1, H, H*2)
+
+        # 학습 변수: light_maps, scale_raw (둘만)
+        self.light_maps_ = nn.Parameter(self.base, requires_grad=train_lights)     # [K,3,H,W]
+        init_scale = torch.full((1, 3), 0.0, dtype=torch.float32) # [K,3]
+        def softplus_inv(y, eps=1e-6):
+            y = (y - self.s_min).clamp_min(eps)
+            return torch.log(torch.expm1(y))
+        self.scale_raw = nn.Parameter(softplus_inv(init_scale), requires_grad=train_lights)  # [K,3]
+
+        self.use_lights = True
+        self.base_param = None  # HDR 모드에서는 사용 안 함
+
     def set_lights_from_hdr(self, light_map_list, train_lights=True):
         # HDR 리스트가 없으면 base-only 모드
         if not light_map_list[0]:
@@ -326,6 +341,11 @@ class DirectLightMap(nn.Module):
         매 iteration 시작 전에 호출. 반환 없음. self.base만 갱신.
         그래프 유지. device는 메인에서 model.to(device)로 일괄 이동.
         """
+        if light_map_path is None:
+            env   = self._base(0)
+            self.base = env.unsqueeze(0)
+            return
+        
         if not self.use_lights:
             if self.base_param is not None:
                 self.base = self.base_param      # 그래프 유지
