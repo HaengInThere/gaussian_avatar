@@ -692,29 +692,76 @@ def rodrigues_to_quat(rvec: torch.Tensor, angle_cap: float = 0.35, eps: float = 
     q = torch.cat([w, xyz], dim=-1)
     return q / q.norm(dim=-1, keepdim=True).clamp_min(eps)
 
-
-def vector_to_quat(v: torch.Tensor) -> torch.Tensor:
+def vector_to_quat(n: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
-    v: (..., 3) normalized direction vector
-    return: (..., 4) quaternion (w, x, y, z)
+    Quaternion that rotates +Z to vector n.
+    n: (3,N), returns (4,N) as [w,x,y,z] in rows.
+    Stable at c≈±1 without sqrt(·) in forward.
     """
-    z = torch.tensor([0, 0, 1], device=v.device, dtype=v.dtype).expand_as(v)
-    v = F.normalize(v, dim=-1)
+    if n.dim() != 2 or n.shape[0] != 3:
+        raise ValueError(f"Expected input shape (3,N), got {n.shape}")
 
-    # 회전축
-    axis = torch.cross(z, v, dim=-1)
-    axis_norm = torch.linalg.norm(axis, dim=-1, keepdim=True).clamp(min=1e-8)
-    axis = axis / axis_norm
+    # 1) normalize input
+    n = F.normalize(n, dim=0, eps=eps)  # (3,N)
+    nx, ny, nz = n[0:1, :], n[1:2, :], n[2:3, :]
 
-    # 회전각
-    cos_theta = (z * v).sum(dim=-1, keepdim=True).clamp(-1, 1)
-    theta = torch.acos(cos_theta)
+    # 2) dot+cross closed-form (a=+Z)
+    #    q_raw = [1 + dot(z, n),  cross(z, n)] = [1 + nz, (-ny, nx, 0)]
+    w  = 1.0 + nz                         # (1,N)
+    xyz = torch.cat([-ny, nx, torch.zeros_like(nx)], dim=0)  # (3,N)
 
-    # quaternion 생성
-    half = theta * 0.5
-    w = torch.cos(half)
-    xyz = axis * torch.sin(half)
-    return torch.cat([w, xyz], dim=-1)  # (w, x, y, z)
+    # 3) handle near-opposite (nz ≈ -1 ⇒ w ≈ 0 and cross(z,n)≈0)
+    #    choose a stable axis in the XY plane; if XY≈0, fall back to +X.
+    near_opposite = (w.abs() <= 1e-6)           # (1,N) bool
+    if near_opposite.any():
+        axis_xy = torch.cat([nx, ny, torch.zeros_like(nx)], dim=0)         # (3,N)
+        axis_xy = F.normalize(axis_xy, dim=0, eps=eps)                     # may be 0 if nx=ny=0
+        fallback = torch.zeros_like(axis_xy); fallback[0, :] = 1.0         # +X
+        use_fallback = (axis_xy.abs().sum(dim=0, keepdim=True) <= 0.0)     # (1,N)
+        axis_safe = torch.where(use_fallback.expand_as(axis_xy), fallback, axis_xy)  # (3,N)
+
+        w  = torch.where(near_opposite, torch.zeros_like(w), w)            # set w=0 for 180°
+        xyz = torch.where(near_opposite.expand_as(xyz), axis_safe, xyz)    # unit axis
+
+    # 4) normalize quaternion safely (no boolean indexing)
+    q = torch.cat([w, xyz], dim=0)                 # (4,N)
+    norm = torch.linalg.norm(q, dim=0, keepdim=True).clamp_min(eps)
+    q = q / norm
+    return q
+
+def vector_map_to_quat_fast(n: torch.Tensor, assume_unit: bool = True, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Rotate +Z to n. Input (B,3,H,W). Output (B,4,H,W).
+    """
+    if n.dim() != 4 or n.size(1) != 3:
+        raise RuntimeError(f"Expected (B,3,H,W), got {tuple(n.shape)}")
+
+    nx, ny, nz = n[:,0], n[:,1], n[:,2]  # (B,H,W)
+
+    if not assume_unit:
+        invlen = (nx*nx + ny*ny + nz*nz + eps).rsqrt()
+        nx = nx * invlen; ny = ny * invlen; nz = nz * invlen
+
+    w = 1.0 + nz
+    x = -ny
+    y =  nx
+    z =  torch.zeros_like(nz)
+
+    m = (w.abs() <= 1e-6)
+    axis_len = torch.sqrt(nx*nx + ny*ny + eps)
+    ax = nx / axis_len
+    ay = ny / axis_len
+    az = torch.zeros_like(ax)
+
+    x = torch.where(m, ax, x)
+    y = torch.where(m, ay, y)
+    z = torch.where(m, az, z)
+    w = torch.where(m, torch.zeros_like(w), w)
+
+    qn = torch.sqrt(w*w + x*x + y*y + z*z).clamp_min(eps)
+    w = w / qn; x = x / qn; y = y / qn; z = z / qn
+
+    return torch.stack([w, x, y, z], dim=1)  # (B,4,H,W)
 
 
 def rotate_canon_to_normal(base_normal: torch.Tensor, canon_xyz: torch.Tensor) -> torch.Tensor:
@@ -887,3 +934,42 @@ def _global_ray_visibility_prior(
     d_front = torch.gather(d_front_bins, 1, bins).view(B, 1, H, W)
     vis_prior = torch.sigmoid((d_front - dist) * beta)
     return vis_prior
+
+def _qnormalize(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Numerically-stable quaternion normalize with fallback to identity when ||q||≈0.
+    q shape (B,4,H,W) as [w,x,y,z] along dim=1.
+    Returns (B,4,H,W).
+    """
+    if q.shape[1] != 4:
+        raise ValueError(f"_qnormalize expects dim=1 to be 4, got {q.shape}")
+
+    # ||q|| over the quaternion components
+    norm = torch.linalg.norm(q, dim=1, keepdim=True)  # (B,1,H,W)
+
+    # normalize safely
+    q_div = q / norm.clamp_min(eps)
+
+    # identity quaternion [1,0,0,0]
+    ident = torch.zeros_like(q_div)
+    ident[:, 0] = 1.0
+
+    # if norm small, fallback
+    safe = (norm > eps).expand_as(q)  # (B,4,H,W)
+    qn = torch.where(safe, q_div, ident)
+    return qn
+
+def _qmul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    # 1,4,W,H to 1,4,W,H
+    """
+    Hamilton product for per-pixel quaternions in (w,x,y,z) with shape (B,4,H,W).
+    Returns (B,4,H,W).
+    """
+    w1, x1, y1, z1 = q1[:,0], q1[:,1], q1[:,2], q1[:,3]
+    w2, x2, y2, z2 = q2[:,0], q2[:,1], q2[:,2], q2[:,3]
+    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+    return torch.stack([w, x, y, z], dim=1)
+

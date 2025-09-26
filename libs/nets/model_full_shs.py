@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from typing import Dict, Optional
 
 
-from libs.utils.graphics_utils import quat_rotate, rotate_canon_to_normal
+from libs.utils.graphics_utils import quat_rotate, rotate_canon_to_normal, vector_to_quat, _qnormalize, _qmul, vector_map_to_quat_fast
 # ----------------------------
 # GroupNorm helper
 # ----------------------------
@@ -29,28 +29,6 @@ def _make_pos_ch(H: int, W: int) -> torch.Tensor:
     ones = torch.ones_like(xx)
     pos = torch.stack([xx, yy, ones], dim=0).unsqueeze(0)  # (1,3,H,W)
     return pos
-
-# ----------------------------
-# Quaternion utilities (channel-first maps)
-# ----------------------------
-def _qnormalize(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    # q: (B,4,H,W)
-    n = torch.linalg.norm(q, dim=1, keepdim=True).clamp_min(eps)
-    return q / n
-
-def _qmul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
-    """
-    Hamilton product for per-pixel quaternions in (w,x,y,z) with shape (B,4,H,W).
-    Returns (B,4,H,W).
-    """
-    w1, x1, y1, z1 = q1[:,0], q1[:,1], q1[:,2], q1[:,3]
-    w2, x2, y2, z2 = q2[:,0], q2[:,1], q2[:,2], q2[:,3]
-    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
-    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
-    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
-    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
-    return torch.stack([w, x, y, z], dim=1)
-
 
 
 # ----------------------------
@@ -320,68 +298,35 @@ class UVPredictorUNet(nn.Module):
 
         # return {"dpos": dpos, "dslog": dslog, "drot": drot, "dnormal": dnormal}
 
-    def _compose_geo_for_app(self, geom, dgeom):
-
-        B, _, H, W = dgeom["dpos"].shape
-        canon_xyz  = geom["canon_xyz"].unsqueeze(0).expand(B, -1, -1, -1)            # (B,3,H,W)
-        canon_slog = geom["canon_slog"].unsqueeze(0).expand(B, -1, -1, -1)          # (B,3,H,W)
-        canon_rot  = _qnormalize(geom["canon_rot"]).unsqueeze(0).expand(B, -1, -1, -1)  # (B,4,H,W)
-
-        dpos    = dgeom["dpos"]
-        dslog   = dgeom["dslog"]
-        drot    = _qnormalize(dgeom["drot"])
-        dnormal = dgeom["dnormal"]
-
-        # ===== build_gaussian 와 동일한 기준으로 맞추기 =====
-        # base_pos: (1,N,3) → (1,3,H,W) → (B,3,H,W)
-        uv_base_pos = geom["uv_base_pos"].expand(B, -1, -1, -1)
-        uv_base_normal = geom["uv_base_normal"].expand(B, -1, -1, -1)
-
-        # Position
-        canon_pos_rotated = rotate_canon_to_normal(uv_base_normal, canon_xyz)
-        dpos_base_rotated = rotate_canon_to_normal(uv_base_normal, dpos)
-        pos  = uv_base_pos + canon_pos_rotated + dpos_base_rotated   # ★ 
-        # Scale (log-domain)
-        slog = canon_slog + dslog                                     # ★ 동일
-
-        # Rotation
-        rot = _qmul(drot, canon_rot)                                 # ★ 동일
-        rot = _qnormalize(rot)
-        # Normal: base_normal (+ dnormal)
-        base_normal_uv = uv_base_normal.expand(B, -1, -1, -1)
-        if dnormal is not None:
-            normal = F.normalize(base_normal_uv + dnormal, dim=1, eps=1e-6)
-        else:
-            normal = F.normalize(base_normal_uv, dim=1, eps=1e-6)
-
-        return {
-            "pos": pos,
-            "slog": slog,
-            "rot":  rot,
-            "normal": normal,
-            "geo_feat": dgeom["geo_feat"],
-        }
-    
-    def forward_canon_geo(self, geom):
-        canon_xyz  = geom["canon_xyz"].unsqueeze(0).expand(1, -1, -1, -1)            # (B,3,H,W)
-        canon_slog = geom["canon_slog"].unsqueeze(0).expand(1, -1, -1, -1)          # (B,3,H,W)
-        canon_rot  = _qnormalize(geom["canon_rot"]).unsqueeze(0).expand(1, -1, -1, -1)  # (B,4,H,W)
-
-
-        # ===== build_gaussian 와 동일한 기준으로 맞추기 =====
+    def forward_static_geo(self, geom):
+        C, H, W =  geom["canon_xyz"].shape
+        canon_xyz  = geom["canon_xyz"].unsqueeze(0).expand(1, -1, -1, -1)  # (B,3,H,W)
+        canon_slog = geom["canon_slog"].unsqueeze(0).expand(1, -1, -1, -1)  # (B,3,H,W)
+        canon_rot = geom["canon_rot"].unsqueeze(0).expand(1, -1, -1, -1)   # (1,H,W,4)
         # base_pos: (1,N,3) → (1,3,H,W) → (B,3,H,W)
         uv_base_pos = geom["uv_base_pos"].expand(1, -1, -1, -1)
         uv_base_normal = geom["uv_base_normal"].expand(1, -1, -1, -1)
+
+        _eps = 1e-6
+        _n = uv_base_normal
+        _mag = torch.linalg.norm(_n, dim=1, keepdim=True)
+        _fallback = torch.tensor([0.0, 0.0, 1.0], device=_n.device, dtype=_n.dtype).view(1,3,1,1)
+        _n = torch.where(_mag > _eps, _n, _fallback.expand_as(_n))
+        uv_base_normal = F.normalize(_n, dim=1, eps=_eps)
 
         # Position
         canon_pos_rotated = rotate_canon_to_normal(uv_base_normal, canon_xyz)
         pos  = uv_base_pos + canon_pos_rotated   # ★ 
         # Scale (log-domain)
-        slog = canon_slog                                   # ★ 동일
+        slog = torch.clamp(canon_slog, min=-8.0, max=1.5) 
 
         # Rotation                              # ★ 동일
-        rot = _qnormalize(canon_rot)
-        # Normal: base_normal (+ dnormal)
+        q_base = _qnormalize(canon_rot)  # (B,4,H,W)
+        H = uv_base_normal.shape[-2]; W = uv_base_normal.shape[-1]
+        vn = uv_base_normal.reshape(3,-1)      # (B*H*W,3)  B=1 here
+        q_n = vector_map_to_quat_fast(uv_base_normal) # (4, B*H*W)
+        q_n = _qnormalize(q_n)
+        rot = _qnormalize(_qmul(q_n, q_base))
 
         # base normal. 배치 크기에 맞춰 확장
         n = F.normalize(uv_base_normal, dim=1, eps=1e-6)  # [B,3,H,W]
@@ -406,17 +351,78 @@ class UVPredictorUNet(nn.Module):
         delta_scale = getattr(self, "delta_normal_scale", 1.0)  # 필요 시 크기 조절
         normal = F.normalize(n + delta_scale * torch.cross(omega_world, n, dim=1), dim=1, eps=1e-6)
 
+        out = {
+            "static_pos": pos,
+            "static_slog": slog,
+            "static_rot":  rot,
+            "static_normal": normal,
+        }
+        for k in list(out.keys()):
+            out[k] = torch.nan_to_num(out[k], nan=0.0, posinf=1e6, neginf=-1e6)
+        return out
+    
+    def _forward_full_geo(self, geom, static_geom, dgeom):
+        B, _, H, W = dgeom["dpos"].shape
+
+        dpos    = dgeom["dpos"]
+        dslog   = dgeom["dslog"]
+        drot    = _qnormalize(dgeom["drot"])
+        dnormal = dgeom["dnormal"]
+
+        # ===== build_gaussian 와 동일한 기준으로 맞추기 =====
+        # base_pos: (1,N,3) → (1,3,H,W) → (B,3,H,W)
+        uv_base_normal = geom["uv_base_normal"].expand(B, -1, -1, -1)
+
+        _eps = 1e-6
+        _n = uv_base_normal
+        _mag = torch.linalg.norm(_n, dim=1, keepdim=True)
+        _fallback = torch.tensor([0.0, 0.0, 1.0], device=_n.device, dtype=_n.dtype).view(1,3,1,1)
+        _n = torch.where(_mag > _eps, _n, _fallback.expand_as(_n))
+        uv_base_normal = F.normalize(_n, dim=1, eps=_eps)
+
+        # position
+        dpos_base_rotated = rotate_canon_to_normal(uv_base_normal, dpos)
+        pos  = static_geom["static_pos"] + dpos_base_rotated
+
+        # Scale (log-domain)
+        slog = torch.clamp(static_geom["static_slog"] + dslog, min=-8.0, max=1.5)                             # ★ 동일
+
+        # rotation
+        rot = _qnormalize(_qmul(drot, static_geom["static_rot"]))
+
+        # Normal: base_normal (+ dnormal)
+        static_geom["static_normal"] = static_geom["static_normal"].expand(B, -1, -1, -1)
+        n = F.normalize(static_geom["static_normal"], dim=1, eps=1e-6)  # [B,3,H,W]
+
+        up   = torch.tensor([0.0, 1.0, 0.0], device=n.device, dtype=n.dtype).view(1,3,1,1).expand_as(n)
+        side = torch.tensor([1.0, 0.0, 0.0], device=n.device, dtype=n.dtype).view(1,3,1,1).expand_as(n)
+        use_side = (n.mul(up).sum(1, keepdim=True).abs() > 0.99).expand_as(n)
+        a = torch.where(use_side, side, up)
+
+        t = F.normalize(torch.cross(a, n, dim=1), dim=1, eps=1e-6)  # tangent
+        b = F.normalize(torch.cross(n, t, dim=1), dim=1, eps=1e-6)  # bitangent
+
+        omega_local = dnormal
+
+        # 로컬->월드 변환
+        omega_world = omega_local[:, :1] * t + omega_local[:, 1:2] * b + omega_local[:, 2:3] * n
+
+        # 작은 회전 근사: n' = n + ω × n. 이후 정규화
+        normal = F.normalize(n + torch.cross(omega_world, n, dim=1), dim=1, eps=1e-6)
+
         return {
             "pos": pos,
             "slog": slog,
             "rot":  rot,
             "normal": normal,
+            "geo_feat": dgeom["geo_feat"],
         }
     
     def forward_gaussian_app(
         self,
+        geom,
         flame_cond: torch.Tensor,
-        geometry: Dict[str, torch.Tensor],
+        full_geom: Dict[str, torch.Tensor],
         cam_pos: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
 
@@ -436,21 +442,21 @@ class UVPredictorUNet(nn.Module):
         cam_dir = F.normalize(cam_pos, dim=1, eps=1e-6)        # (B,3,1,1)
         cam_dir = cam_dir.expand(B, 3, H, W)                   # (B,3,H,W)
 
-        Vv = cam_pos - geometry['pos']
+        Vv = cam_pos - full_geom['pos']
         dist = Vv.norm(dim=1, keepdim=True).clamp_min(1e-6) # * 
         V_unit = Vv / dist # *
 
-        q = _qnormalize(geometry['rot'].permute(0,2,3,1).reshape(-1,4))
+        q = _qnormalize(full_geom['rot'].permute(0,2,3,1).reshape(-1,4))
         z_axis = torch.tensor([0, 0, 1.0], device=q.device, dtype=q.dtype).expand(q.shape[0],3)
         n = quat_rotate(q, z_axis).view(1,H,W,3).permute(0,3,1,2)
 
         nv_cos = (n * V_unit)  # *
         cam_feats = torch.cat([V_unit, dist, nv_cos], dim=1)
 
-        feats = torch.cat([geometry['pos'],  # 3
-                           geometry['slog'],  # 3
-                           geometry['rot'],  # 4
-                           geometry['geo_feat'], # 32
+        feats = torch.cat([full_geom['pos'],  # 3
+                           full_geom['slog'],  # 3
+                           full_geom['rot'],  # 4
+                           full_geom['geo_feat'], # 32
                            cam_dir,  # 3
                            cam_feats # 7
                            ], dim=1)  # 3 + 3 + 4 + 32 + 3 + 7
@@ -554,23 +560,25 @@ class UVPredictorUNet(nn.Module):
         flame_cond=geom['params']
         # Predict Gaussians' geometry (dpos, dslog, drot)
         dgeom = self.forward_gaussian_dgeo(flame_cond)
-        geometry = self._compose_geo_for_app(geom, dgeom)
+        static_geom = self.forward_static_geo(geom)
+        full_geom = self._forward_full_geo(geom, static_geom, dgeom)
         app_pred = self.forward_gaussian_app(
+            geom,
             flame_cond,
-            geometry,
+            full_geom,
             cam_pos=geom["cam_pos"],
         )
 
         if env_map is not None:
             lv_pred = self.forward_lightview(
                 flame_cond,
-                geometry,
+                full_geom,
                 cam_pos=geom["cam_pos"],
                 env_map=env_map,
             )
             out = {
                 **dgeom,
-                **geometry,
+                **full_geom,
                 **app_pred,
                 **lv_pred,
                 "opacity": torch.sigmoid(app_pred["opacity_logit"]),
@@ -581,7 +589,7 @@ class UVPredictorUNet(nn.Module):
 
             out = {
                 **dgeom,
-                **geometry,
+                **full_geom,
                 **app_pred,
                 "opacity": torch.sigmoid(app_pred["opacity_logit"]),
             }
@@ -607,9 +615,7 @@ class UVPredictorUNet(nn.Module):
             raise ValueError("Invalid stage. Choose 'full', 'base', or 'normal'.")
 
         eps = float(training_args.get("adam_eps", 1e-8))
-
         params: list = []
-
         if stage in ("full", "base"):
             # geometry
             params += list(self.cond_geo_mlp.parameters())
@@ -675,6 +681,47 @@ class UVPredictorUNet(nn.Module):
             params += list(self.env_to_app.parameters())
             params += list(self.env_encoder.parameters())
             
+            # keep only trainable nn.Parameter (leafs)
+            params = [p for p in params if isinstance(p, nn.Parameter) and p.requires_grad]
+
+        elif stage == "gray":
+            # geometry
+            params += list(self.cond_geo_mlp.parameters())
+            params += list(self.unet_geo.parameters())
+            params += list(self.head_dpos.parameters())
+            params += list(self.head_scale.parameters())
+            params += list(self.head_rot.parameters())
+            params += list(self.head_dnormal_diff.parameters())
+            params += [
+                        self.dpos_scale, 
+                       self.scale_log_range, 
+                       self.dnormal_scale]
+
+            # appearance
+            params += list(self.cond_app_mlp.parameters())
+            params += list(self.unet_app.parameters())
+            params += list(self.head_color.parameters())
+            params += list(self.head_opacity.parameters())
+            
+            params += list(self.cond_normal_mlp.parameters())
+            params += list(self.unet_normal.parameters())
+            # params += list(self.head_dnormal_spec.parameters())
+            # params += list(self.head_spec_scale.parameters())
+
+            # view-only and light-only branches
+            params += list(self.cond_view_mlp.parameters())
+            params += list(self.unet_view.parameters())
+            params += list(self.head_view_vis.parameters())
+
+            params += list(self.cond_light_mlp.parameters())
+            params += list(self.unet_light.parameters())
+            params += list(self.head_light_shading_d.parameters())
+            params += list(self.head_light_shading_s.parameters())
+            # params += [self.dnormal_spec_scale]
+
+            params += list(self.env_to_app.parameters())
+            params += list(self.env_encoder.parameters())
+
             # keep only trainable nn.Parameter (leafs)
             params = [p for p in params if isinstance(p, nn.Parameter) and p.requires_grad]
         else:

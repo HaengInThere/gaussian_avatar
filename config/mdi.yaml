@@ -2,7 +2,7 @@ mode: train
 lmk_path: "./assets/flame/landmark_embedding.npy"
 template_mesh_path: "./assets/flame/head_template_mesh_vhap.obj"  # make from flame.py
 white_background: true
-tex_size: 256
+tex_size: 512
 normal_offset: 0.05 
 n_shape: 300
 n_expr: 100
