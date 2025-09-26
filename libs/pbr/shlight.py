@@ -66,10 +66,24 @@ class SHLight(nn.Module):
         L = (B * self.coeffs.view(1, -1)).sum(-1, keepdim=True)  # (M,1)
         return F.softplus(L, beta=5.0).reshape(*orig, 1)
 
-    def shade_rgb(self, normals: torch.Tensor, base_gray: float = 0.7) -> torch.Tensor:
+    def shade_rgb(self, normals: torch.Tensor, base_gray) -> torch.Tensor:
         L = self.forward(normals)[..., 0]                 # (...,)
         rgb = (base_gray * L).unsqueeze(-1).repeat(1, 3)  # (N,3) contiguous
         return rgb.contiguous()
+
+    def shade_with_albedo(self, normals: torch.Tensor, albedo_rgb: torch.Tensor) -> torch.Tensor:
+        """
+        Lambertian shading with per-Gaussian albedo.
+        normals: (N,3) or (B,N,3)
+        albedo_rgb: (N,3) or (B,N,3) in [0,1]. If (...,1) it will be broadcast to 3 channels.
+        returns: same shape as albedo_rgb, contiguous
+        """
+        L = self.forward(normals)[..., 0]  # (...,)
+        # Ensure albedo has 3 channels
+        if albedo_rgb.shape[-1] == 1:
+            albedo_rgb = albedo_rgb.repeat_interleave(3, dim=-1)
+        shaded = albedo_rgb * L.unsqueeze(-1)
+        return shaded.contiguous()
     
     def training_setup(self, cfg_train: dict):
         self.optimizer = torch.optim.Adam(

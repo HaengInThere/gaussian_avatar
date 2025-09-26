@@ -219,32 +219,33 @@ def main(args):
         N = R.shape[0]
 
         # 2) 법선 계산. 로컬 z축을 월드로 회전
-        z_axis = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=torch.float32).expand(N, 3)
-        g_normals = quat_rotate(R, z_axis)           # (N,3)
+
 
         # Debug/aux: check irradiance spread to avoid degenerate constant-light cases
         with torch.no_grad():
-            L_dbg = sh_light.irradiance(g_normals)  # (N,)
+            L_dbg = sh_light.irradiance(g.get_normal)  # (N,)
             L_var = L_dbg.var().item()
 
-        # 3) 전역 SH 조명. 평균을 1로 정규화하면 광도 스케일 분리가 안정적
-        shaded_dc = sh_light.shade_rgb(g_normals, BASE_GRAY)  # (N,3)
-        shaded_dc = shaded_dc.view(N, 1, 3).contiguous()      # (N,1,3)
+        # 3) 전역 SH 조명 × 최적화된 알베도/컬러
+        #    g._get_albedo: (N,3) 또는 (N,1) 가정. 필요시 3채널로 확장.
+        albedo_rgb = g.get_albedo  # optimized per-Gaussian color/albedo in [0,1]
+        shaded_dc = sh_light.shade_with_albedo(g.get_normal, albedo_rgb)  # (N,3)
+        shaded_dc = shaded_dc.view(N, 1, 3).contiguous()  # (N,1,3)
         # Optional: zero-out higher-order color to enforce DC-only rendering
 
-        # ----------------------------------------------- Gray render -------------------------------------------------
-        if isinstance(g, dict) and "features_rest" in g and g["features_rest"] is not None:
-            g["features_rest"] = torch.zeros_like(g["features_rest"])
-        elif hasattr(g, "_features_rest") and g._features_rest is not None:
-            g._features_rest = torch.zeros_like(g._features_rest)
+        # ----------- Gray render --------------
+        # if isinstance(g, dict) and "features_rest" in g and g["features_rest"] is not None:
+        #     g["features_rest"] = torch.zeros_like(g["features_rest"])
+        # elif hasattr(g, "_features_rest") and g._features_rest is not None:
+        #     g._features_rest = torch.zeros_like(g._features_rest)
 
         if isinstance(g, dict):
             g["features_dc"] = shaded_dc
-            g["opacity"]     = torch.full((N, 1), FIXED_ALPHA, device=device, dtype=torch.float32)
+            # g["opacity"]     = torch.full((N, 1), FIXED_ALPHA, device=device, dtype=torch.float32)
         else:
             g._features_dc = shaded_dc
-            g._opacity     = torch.full((N, 1), FIXED_ALPHA, device=device, dtype=torch.float32)
-        # ----------------------------------------------- Gray render ------------------------------------------------- 
+            # g._opacity     = torch.full((N, 1), FIXED_ALPHA, device=device, dtype=torch.float32)
+        # ---------- Gray render -------------------- 
 
         # 5) 베이직 스플랫 렌더
         render_output = render_base(viewpoint_cam, g, background)     # {'render': [1,3,H,W]}
@@ -252,17 +253,15 @@ def main(args):
         # 6) 손실은 흑백으로
         pred = torch.clamp(render_output['render'], 0.0, 1.0)
         gt   = torch.clamp(viewpoint_cam.original_image.to(device), 0.0, 1.0)
-        to_gray = lambda x: (0.2126*x[0:1] + 0.7152*x[1:2] + 0.0722*x[2:3])
-        pred_y = to_gray(pred)
-        gt_y   = to_gray(gt)
-        # Data-driven lighting cue: match global brightness to force coeff updates
-        light_mean_loss = 0.05 * (pred_y.mean() - gt_y.mean()).abs()
+        # to_gray = lambda x: (0.2126*x[0:1] + 0.7152*x[1:2] + 0.0722*x[2:3])
+        # pred_y = to_gray(pred)
+        # gt_y   = to_gray(gt)
 
-        # rgb_l2 = F.mse_loss(pred_y, gt_y)
-        ssim_loss = criterions.get_dssim_loss(pred_y, gt_y)
+        rgb_l1 = F.l1_loss(pred, gt)
+        ssim_loss = criterions.get_dssim_loss(pred, gt)
         # coeff_reg = 1e-4 * (sh_light.coeffs ** 2).mean()
         loss = ssim_loss
-        loss_output = {'loss': loss, 'ssim_loss': ssim_loss} #, 'rgb_loss': rgb_l2, 'light_mean': light_mean_loss}
+        loss_output = {'loss': loss, 'ssim_loss': ssim_loss, 'rgb_loss': rgb_l1}
 
         head_model.optimizer.zero_grad(set_to_none=True)
         uv_net.optimizer.zero_grad(set_to_none=True)
@@ -350,7 +349,7 @@ if __name__=="__main__":
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument("--config", required=False, default='./config/mdi.yaml', help="path to the yaml config file")
     parser.add_argument("--gpu_id", required=False, default=0, help="path to the yaml config file")
-    parser.add_argument("--train_stage", required=False, default="gray", help="path to the yaml config file")
+    parser.add_argument("--train_stage", required=False, default="full", help="path to the yaml config file")
     parser.add_argument("--testing_iterations", required=False, default=[1000000])
     parser.add_argument("--saving_iterations", required=False, default=[1000000])
     parser.add_argument("--full_iter", default=1000000)
