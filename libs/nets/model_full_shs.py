@@ -466,22 +466,25 @@ class UVPredictorUNet(nn.Module):
         a_in = torch.cat([feats, cond_app], dim=1)
         _, _, _, a_last = self.unet_app(a_in)
 
-        features_dc_logit = self.head_color(a_last)
-        opacity_logit     = self.head_opacity(a_last)
+        dfeatures_dc_logit = self.head_color(a_last)
+        dopacity_logit     = self.head_opacity(a_last)
 
+        features_dc_logit = geom["canon_color"] + dfeatures_dc_logit
+        opacity_logit = geom["canon_opacity"] + dopacity_logit
 
         cond_normal = self.cond_normal_mlp(flame_cond).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, W)
 
         normal_in = torch.cat([feats, cond_normal], dim=1)
         _, _, _, normal_last = self.unet_normal(normal_in)
 
-        dnormal_spec      = torch.tanh(self.head_dnormal_spec(normal_last)) * self.dnormal_spec_scale
-        spec_scale        = torch.sigmoid(self.head_spec_scale(normal_last))
+        # 지금은 안씀 
+        dnormal_spec      = torch.tanh(self.head_dnormal_spec(normal_last))
+        full_normal = full_geom['normal'] + dnormal_spec
+
         return {
             "features_dc_logit": features_dc_logit,
             "opacity_logit":     opacity_logit,
-            "dnormal_spec":      dnormal_spec,
-            "spec_scale":        spec_scale,
+            "full_normal":      full_normal,
         }
 
     def forward_lightview(
