@@ -396,7 +396,7 @@ class PBRAvatarLoss(nn.Module):
         # PBRAvatarLoss.forward 내부 예시
         def _down(x, size=512):
             H, W = x.shape[-2:]
-            if max(H, W) <= size:
+            if min(H, W) <= size:
                 return x
             return F.interpolate(x, size=size, mode='area')
 
@@ -407,11 +407,11 @@ class PBRAvatarLoss(nn.Module):
         loss = self.get_rgb_loss(render_image, gt_image) * 0.8
         out = {'loss': loss, 'rgb_loss': loss}
         
-        dssim_loss = self.get_dssim_loss(I_pred_small, I_gt_small)
+        dssim_loss = self.get_dssim_loss(render_image, gt_image)
         out['ssim'] = dssim_loss
         out['loss'] += dssim_loss * 0.2
 
-        lpips_loss = self.get_lpips_loss(I_pred_small, I_gt_small)
+        lpips_loss = self.get_lpips_loss(render_image, gt_image)
         out['lpips'] = dssim_loss
         out['loss'] += lpips_loss.squeeze() * 0.2
 

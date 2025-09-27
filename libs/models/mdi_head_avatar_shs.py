@@ -800,11 +800,11 @@ class MDIHeadAvatar(nn.Module):
         reg_drot_id = _mean_on_mask(((1.0 - uv_maps['drot'][:, :1]) ** 2))                 # w-성분 중심
 
         reg_terms = {
-            "canon_l1":       reg_canon_xyz,
-            "dpos_l2":        reg_dpos,
+            # "canon_l1":       reg_canon_xyz,
+            # "dpos_l2":        reg_dpos,
             # "dslog_l2":       reg_dslog,
             # "dnormal_l2":     reg_dnormal,
-            "drot_identity":  reg_drot_id,
+            # "drot_identity":  reg_drot_id,
             # "tv_dpos":        reg_tv_dpos,
             # "tv_dslog":       reg_tv_dslog,
             # "tv_drot":        reg_tv_drot,
